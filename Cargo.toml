@@ -3,5 +3,6 @@ name = "together"
 version = "0.1.0"
 edition = "2018"
 description = "Efficient CRDTs for everyone."
+license = "MIT"
 
 [dependencies]
