@@ -10,6 +10,25 @@ pub struct Entry<T> {
     pub parent: Option<Id>,
 }
 
+trait Range where Self: Sized {
+    fn len(&self) -> usize;
+    fn split(self, index: usize) -> (Self, Self);
+    fn push(&mut self, other: Self);
+}
+
+pub struct RangeRope<K: Ord, V: Range> {
+    total_size: usize,
+    key: K,
+    val: V,
+    children: Vec<Self>,
+}
+
+// impl<K: Ord, V: Range> RangeRope<K, V> {
+//     pub fn insert(&mut self, index, )
+// }
+
+// Needs to be quick to find by Id and Index
+
 #[derive(Debug)]
 pub struct Doc<T> {
     pub contents: Vec<Entry<T>>,
