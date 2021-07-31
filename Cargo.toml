@@ -1,6 +1,7 @@
 [package]
 name = "together"
 version = "0.1.0"
+authors = ["Isaac Clayton (slightknack) <slightknack@gmail.com>"]
 edition = "2018"
 description = "Efficient CRDTs for everyone."
 license = "MIT"
