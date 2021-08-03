@@ -10,22 +10,29 @@ pub struct Entry<T> {
     pub parent: Option<Id>,
 }
 
-trait Range where Self: Sized {
+pub trait Range where Self: Sized {
     fn len(&self) -> usize;
     fn split(self, index: usize) -> (Self, Self);
-    fn push(&mut self, other: Self);
+    fn join(right: Self, left: Self);
 }
 
-pub struct RangeRope<K: Ord, V: Range> {
-    total_size: usize,
-    key: K,
-    val: V,
-    children: Vec<Self>,
+pub struct RangeRope<T: Range> {
+    
 }
 
-// impl<K: Ord, V: Range> RangeRope<K, V> {
-//     pub fn insert(&mut self, index, )
-// }
+impl<K: Ord, V: Range> Range for RangeRope<K, V> {
+    fn len(&self) -> usize {
+        self.total_size
+    }
+
+    fn split(self, index: usize) -> (Self, Self) {
+
+    }
+
+    fn join(right: Self, left: Self) -> Self {
+
+    }
+}
 
 // Needs to be quick to find by Id and Index
 

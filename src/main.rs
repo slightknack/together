@@ -1,4 +1,5 @@
 mod rope;
+mod tree_log;
 pub use rope::*;
 
 fn main() {
