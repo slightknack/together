@@ -1,66 +1,28 @@
 use std::collections::BTreeMap;
+use crate::{
+    collection::Collection,
+    index_tree::IndexTree,
+};
 
 pub struct User(usize);
 
 // user, index, item
 pub struct Id(User, usize, usize);
 
-pub struct Entry {
+pub struct Edit {
     start:  usize,
     length: usize,
     parent: Id,
     seq:    usize,
 }
 
-pub trait Collection {
-    fn len(&self) -> usize;
-    fn split(self, index: usize) -> (Self, Self);
-    fn append(&mut self, other: Self);
-}
-
-impl<T> Collection for Vec<T> {
-    fn len(&self) -> usize { self.len() }
-
-    fn split(self, index: usize) -> (Self, Self) {
-        let end = self.split_off(index);
-        (self, end)
-    }
-
-    fn append(&mut self, other: Self) {
-        self.append(&mut other);
-    }
-}
-
-impl Collection for String {
-    fn len(&self) -> usize { self.len() }
-
-    fn split(self, index: usize) -> (Self, Self) {
-        let end = self.split_off(index);
-        (self, end)
-    }
-
-    fn append(self, other: Self) {
-        self.push_str(&other);
-    }
-}
-
-pub struct Column<T: Collection> {
+pub struct History<T: Collection> {
     user:     User,
     contents: T,
-    entries:  Vec<Entry>
+    entries:  Vec<Edit>,
 }
 
 pub struct TreeLog<T: Collection> {
-    columns: BTreeMap<User, Column<T>>,
-    tree:    RangeMap<Id>,
-}
-
-pub enum RangeMap<T> {
-    Node {
-        size: usize,
-        children: Vec<Self>,
-    },
-    Leaf {
-        item: T,
-    },
+    columns: BTreeMap<User, History<T>>,
+    tree:    IndexTree<Id>,
 }
