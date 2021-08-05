@@ -29,15 +29,15 @@ impl<T> Collection for IndexTree<T> {
 
         while let IndexTree::Node {
             ref mut size,
-            ref mut children
+            ref mut children,
         } = current {
-            let (before, i) = Self::child_index(&children, index);
+            let (before, i) = Self::child_index(children, index);
             for orphan in children.split_off(i + 1).into_iter().rev() {
                 orphans.push(orphan);
             }
             *size = before + children[i].len();
             current = &mut children[i];
-            index = index - before;
+            index -= before;
         }
 
         orphans.reverse();
@@ -85,23 +85,18 @@ impl<T> IndexTree<T> {
     pub fn get(&self, index: usize) -> &T {
         match self {
             IndexTree::Leaf(item) => item,
-            IndexTree::Node { size, children } => {
-                let (before, i) = Self::child_index(&children, index);
+            IndexTree::Node { children, .. } => {
+                let (before, i) = Self::child_index(children, index);
                 children[i].get(index - before)
             }
         }
     }
 
-    pub fn insert(&mut self, item: T, index: usize) -> Option<T> {
-        match self {
-            IndexTree::Leaf(_) => Some(item),
-            IndexTree::Node { size, children } => {
-                let (before, i) = Self::child_index(&children, index);
-                if let Some(leaf) = children[i].insert(item, index) {
-                    todo!()
-                }
-                todo!()
-            }
-        }
+    pub fn insert(&mut self, item: T, index: usize) {
+        let moved_self = std::mem::replace(self, Self::new());
+        let (mut left, right) = moved_self.split(index);
+        left.append(IndexTree::Leaf(item));
+        left.append(right);
+        *self = left;
     }
 }
