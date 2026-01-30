@@ -664,3 +664,4 @@ Machine-managed files can be freely edited by a chisel. The driver reviews and a
 To convert a human-managed file to machine-managed, the driver explicitly asks the chisel to take over the file. The chisel updates the frontmatter from `author`/`managed` to `model`/`driver` format and proceeds with the requested changes.
 
 To convert a machine-managed file to human-managed, the driver updates the frontmatter themselves. This signals that the driver is taking direct responsibility for the file's contents and the chisel should no longer edit it freely.
+

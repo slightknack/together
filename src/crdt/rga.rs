@@ -274,7 +274,7 @@ impl Rga {
     /// Returns (span_index, offset_within_span).
     /// Uses cursor cache for sequential access patterns.
     fn find_visible_pos(&mut self, pos: u64) -> (usize, u64) {
-        let (cached_pos, cached_idx, cached_cumulative) = self.cursor;
+        let (_cached_pos, cached_idx, cached_cumulative) = self.cursor;
 
         // Check if we can use the cache
         if cached_idx < self.spans.len() && pos >= cached_cumulative {
