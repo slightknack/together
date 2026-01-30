@@ -18,7 +18,7 @@ use x25519_dalek::PublicKey as X25519Public;
 use x25519_dalek::StaticSecret;
 
 /// A public key, 32 bytes on the ed25519 curve.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyPub(pub [u8; 32]);
 
 /// A secret key, 32 bytes.
