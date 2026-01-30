@@ -137,6 +137,47 @@ fn insert_at(target: u64, span: Span) {
 - Delete: O(log n) expected
 - Space: O(n) expected
 
+## Unrolled Indexable Skip List (Better Design)
+
+The key insight is to combine skip lists with chunking/unrolling for cache locality:
+
+**Arena Allocation:**
+- Single contiguous `Vec<Node>` backing store
+- Use u32 indices instead of pointers (half the size, cache friendly)
+- Free list for recycling deleted nodes
+
+**Unrolled Nodes:**
+```rust
+struct Node {
+    items: [T; CHUNK_SIZE],      // 32-64 items per node
+    len: u16,                     // actual count in this chunk
+    height: u8,                   // tower height (1..MAX_HEIGHT)
+    next_indices: [u32; MAX_HEIGHT],  // links at each level
+    widths: [u32; MAX_HEIGHT],    // skip distances at each level
+}
+```
+
+**Key Invariants:**
+1. Sum of widths at any level = total element count
+2. Items within a node are contiguous (no gaps)
+3. Head is a sentinel with MAX_HEIGHT, no data
+
+**Update Vector Pattern:**
+For all mutations, use a stack-allocated `[u32; MAX_HEIGHT]` array to track the path taken during search. This enables O(log n) width updates after insertion.
+
+**Insertion with Split:**
+1. Search and record path in update vector
+2. If chunk has room: shift and insert, increment widths of nodes that skip over us
+3. If chunk full: split into two nodes, rewire pointers at each level
+
+**Why This is Better:**
+- O(log n) position lookup (skip list)
+- O(log n) insertion (update vector)
+- Cache friendly (arena + chunking)
+- No raw pointers (indices are safe and small)
+
+This is essentially what diamond-types' JumpRope does, but with a cleaner explanation.
+
 ## References
 
 - Pugh, William. "Skip Lists: A Probabilistic Alternative to Balanced Trees" (1990)

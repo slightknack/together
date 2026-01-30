@@ -126,6 +126,9 @@ pub struct Rga {
     columns: HashMap<KeyPub, Column>,
     /// Cached visible length.
     visible_len: u64,
+    /// Cursor cache: (visible_pos, span_index, cumulative_visible_before_span).
+    /// Used to accelerate sequential access patterns.
+    cursor: (u64, usize, u64),
 }
 
 impl Rga {
@@ -135,6 +138,7 @@ impl Rga {
             spans: Vec::new(),
             columns: HashMap::new(),
             visible_len: 0,
+            cursor: (0, 0, 0),
         };
     }
 
@@ -214,7 +218,8 @@ impl Rga {
                 self.spans[span_idx].deleted = true;
                 self.visible_len -= span_visible;
                 remaining -= span_visible;
-                // current_pos stays the same (next visible char shifts down)
+                // Invalidate cursor since visible positions changed
+                self.cursor = (0, 0, 0);
             } else if offset_in_span == 0 {
                 // Delete prefix of span - split and delete left part
                 let right = self.spans[span_idx].split(remaining);
@@ -260,22 +265,46 @@ impl Rga {
     }
 
     /// Get the ItemId at a visible position.
-    fn id_at_visible_pos(&self, pos: u64) -> ItemId {
+    fn id_at_visible_pos(&mut self, pos: u64) -> ItemId {
         let (span_idx, offset) = self.find_visible_pos(pos);
         return self.spans[span_idx].id_at(offset);
     }
 
     /// Find the span and offset for a visible position.
     /// Returns (span_index, offset_within_span).
-    fn find_visible_pos(&self, pos: u64) -> (usize, u64) {
-        let mut remaining = pos;
+    /// Uses cursor cache for sequential access patterns.
+    fn find_visible_pos(&mut self, pos: u64) -> (usize, u64) {
+        let (cached_pos, cached_idx, cached_cumulative) = self.cursor;
+
+        // Check if we can use the cache
+        if cached_idx < self.spans.len() && pos >= cached_cumulative {
+            // Start from cache position
+            let mut cumulative = cached_cumulative;
+            for i in cached_idx..self.spans.len() {
+                let span = &self.spans[i];
+                let visible = span.visible_len();
+                if visible > 0 {
+                    if pos < cumulative + visible {
+                        // Update cache
+                        self.cursor = (pos, i, cumulative);
+                        return (i, pos - cumulative);
+                    }
+                    cumulative += visible;
+                }
+            }
+        }
+
+        // Fall back to scanning from the beginning
+        let mut cumulative = 0u64;
         for (i, span) in self.spans.iter().enumerate() {
             let visible = span.visible_len();
             if visible > 0 {
-                if remaining < visible {
-                    return (i, remaining);
+                if pos < cumulative + visible {
+                    // Update cache
+                    self.cursor = (pos, i, cumulative);
+                    return (i, pos - cumulative);
                 }
-                remaining -= visible;
+                cumulative += visible;
             }
         }
         panic!("position {} out of bounds (visible_len={})", pos, self.visible_len);
@@ -331,6 +360,10 @@ impl Rga {
 
     /// Insert a span at raw index.
     fn insert_span_raw(&mut self, idx: usize, span: Span) {
+        // Invalidate cursor if inserting before or at cached position
+        if idx <= self.cursor.1 {
+            self.cursor = (0, 0, 0);
+        }
         self.spans.insert(idx, span);
     }
 
