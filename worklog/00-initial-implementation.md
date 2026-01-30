@@ -69,6 +69,90 @@ Created `research/00-dat.md` documenting the Dat/Hypercore protocol:
 - Bitfield RLE encoding for sparse replication
 - Comparison with together's 16-tree approach
 
+### crdt/mod.rs
+
+Defined the core `Crdt` trait:
+
+```rust
+pub trait Crdt {
+    fn merge(&mut self, other: &Self);
+}
+```
+
+The merge operator must be commutative, associative, and idempotent.
+
+### crdt/rga.rs
+
+Implemented a Replicated Growable Array (RGA) for collaborative text editing.
+
+**Research conducted:**
+- [Diamond Types](https://github.com/josephg/diamond-types) - The world's fastest CRDT
+- [CRDTs go brrr](https://josephg.com/blog/crdts-go-brrr/) - 5000x performance gains through spans, B-trees, and cache-friendly layouts
+- [Zed's Rope & SumTree](https://zed.dev/blog/zed-decoded-rope-sumtree) - B+ trees with hierarchical summaries
+- [Backing stores for CRDTs](https://slightknack.dev/blog/backing-crdt-store/) - Append-only columns per user
+
+**Design decisions (Pareto-efficient for simplicity + performance):**
+
+1. **Spans**: Consecutive insertions by the same user are stored as a single span. Typing "hello" creates one span, not five items. This reduces memory 14x in practice.
+
+2. **Append-only columns**: Each user has a `Column` storing their content. Columns only append, making replication trivial - just send new bytes.
+
+3. **RGA ordering**: When concurrent inserts happen at the same position, order by `(user, seq)` descending. This is deterministic and commutative.
+
+4. **Flat list (for now)**: Currently O(n) for position lookups. The `BRANCHING` constant and `index` field are placeholders for a future B-tree implementation.
+
+**Data structures:**
+
+- `ItemId`: `(user: KeyPub, seq: u64)` - unique identifier for each character
+- `Span`: Run of consecutive items from one user
+- `Node`: Container for spans with summary metadata (visible_len, total_len)
+- `Column`: Per-user content storage with next_seq counter
+- `Rga`: The main structure holding root node and columns
+
+**Operations:**
+
+- `insert(user, pos, content)` - Insert at visible position
+- `delete(start, len)` - Delete range by visible position
+- `apply(user, OpBlock)` - Apply operation from log (idempotent)
+- `merge(other)` - Merge another RGA (CRDT merge)
+
+### crdt/op.rs
+
+Defined operations for log integration:
+
+```rust
+pub enum Op {
+    Insert { origin: Option<ItemId>, seq: u64, len: u64 },
+    Delete { target: ItemId },
+}
+
+pub struct OpBlock {
+    pub op: Op,
+    pub content: Vec<u8>,
+}
+```
+
+**Integration with log.rs:**
+
+Each writer maintains a signed append-only log of `OpBlock`s. The flow:
+
+1. User types "hello" at position 5
+2. Find the `ItemId` at position 4 (the origin)
+3. Create `OpBlock::insert(Some(origin), next_seq, b"hello")`
+4. Append serialized OpBlock to the log
+5. Sign the log
+
+To sync:
+1. Exchange `SignedLog` headers
+2. Request missing blocks using bitfield diff
+3. Verify blocks with `SignedLog::verify_proof`
+4. Apply blocks with `Rga::apply`
+
+The signed log guarantees:
+- Operations are authentic (signed by writer)
+- Operations are ordered within each writer's log
+- Forks are detectable (if a writer rewrites history)
+
 ### Process
 
 Updated PROCESS.md with several conventions discovered during the session:
@@ -77,3 +161,11 @@ Updated PROCESS.md with several conventions discovered during the session:
 - Scripts over instructions principle
 - Following existing patterns when extending systems
 - Using python scripts for calculations
+
+### Test Summary
+
+44 tests total:
+- key.rs: 9 tests
+- log.rs: 17 tests  
+- crdt/rga.rs: 15 tests
+- crdt/op.rs: 3 tests
