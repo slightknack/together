@@ -21,7 +21,7 @@ Some sections contain a "Recommended reading" callout. These are posts that shap
 
 Be pragmatic about reading. You do not need to read everything. Skim first, then dive deep only where relevant to the task at hand. Optimize for learning what you need when you need it. The goal is not to ingest all information but to build understanding efficiently.
 
-This document is living. Like semantic compression, it should be refactored and revised as experience reveals better practices. If you discover a blog or source that meets or exceeds the quality bar of the recommended blogs below, add it to the list. If you learn something that changes how work should be done on this project, update this document. The process improves through use.
+This document is living and not append-only. Like semantic compression, it should be refactored and revised as experience reveals better practices. Sections can be rewritten, reorganized, or removed when they no longer serve. The goal is a clear, current guide, not a historical record. If you discover a blog or source that meets or exceeds the quality bar of the recommended blogs below, add it to the list. If you learn something that changes how work should be done on this project, update this document. The process improves through use.
 
 ## Chisels
 
@@ -475,6 +475,8 @@ When operations are ambiguous, make them explicit. Zig applies this principle: "
 ### How to Research
 
 When exploring a new topic, start by searching the web for primary sources. Read the original papers and blog posts, not summaries. Quote liberally instead of paraphrasing. Contextualize things and present them in the right order.
+
+Write research notes as you research, not after. The act of writing clarifies understanding and creates a record while the material is fresh. Waiting until the end means details are forgotten or conflated. If you decide to research something, open the research file first and write to it as you go.
 
 When you do research, write it up in `research/NN-topic.md`. Run `./scripts/00-next-numbered research topic-name` to get the next filename. Include sources, key insights, and how it relates to this project. Research documents are machine-managed. This creates a persistent record that future contexts can consult without re-fetching the same sources.
 
