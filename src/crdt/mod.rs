@@ -7,6 +7,7 @@
 
 pub mod op;
 pub mod rga;
+pub mod skip_list;
 
 /// A CRDT is a data type with a merge operator that is commutative,
 /// associative, and idempotent.

@@ -124,9 +124,6 @@ pub struct Rga {
     spans: Vec<Span>,
     /// Per-user columns for content storage.
     columns: HashMap<KeyPub, Column>,
-    /// Index from (user, seq) to span index for O(1) lookup.
-    /// Maps the starting seq of each span.
-    index: HashMap<(KeyPub, u64), usize>,
     /// Cached visible length.
     visible_len: u64,
 }
@@ -137,7 +134,6 @@ impl Rga {
         return Rga {
             spans: Vec::new(),
             columns: HashMap::new(),
-            index: HashMap::new(),
             visible_len: 0,
         };
     }
@@ -290,10 +286,8 @@ impl Rga {
         let span_len = span.visible_len();
 
         if self.spans.is_empty() || pos == 0 {
-            self.index.insert((span.user.clone(), span.seq), 0);
             self.spans.insert(0, span);
             self.visible_len += span_len;
-            self.reindex_from(1);
             return;
         }
 
@@ -335,39 +329,18 @@ impl Rga {
         self.visible_len += span_len;
     }
 
-    /// Insert a span at raw index, updating the index.
+    /// Insert a span at raw index.
     fn insert_span_raw(&mut self, idx: usize, span: Span) {
-        self.index.insert((span.user.clone(), span.seq), idx);
         self.spans.insert(idx, span);
-        self.reindex_from(idx + 1);
     }
 
-    /// Reindex spans from the given index onwards.
-    fn reindex_from(&mut self, start: usize) {
-        for i in start..self.spans.len() {
-            let span = &self.spans[i];
-            self.index.insert((span.user.clone(), span.seq), i);
-        }
-    }
-
-    /// Find span containing the given ItemId using the index.
+    /// Find span containing the given ItemId using linear search.
     fn find_span_by_id(&self, id: &ItemId) -> Option<usize> {
-        // First try exact match
-        if let Some(&idx) = self.index.get(&(id.user.clone(), id.seq)) {
-            return Some(idx);
-        }
-
-        // Search for span that contains this seq
-        // Find the largest seq <= id.seq for this user
-        for (&(ref user, seq), &idx) in &self.index {
-            if user == &id.user && seq <= id.seq {
-                let span = &self.spans[idx];
-                if span.contains(id) {
-                    return Some(idx);
-                }
+        for (i, span) in self.spans.iter().enumerate() {
+            if span.contains(id) {
+                return Some(i);
             }
         }
-
         return None;
     }
 }
@@ -443,7 +416,6 @@ impl Rga {
         let span_len = span.visible_len();
 
         if self.spans.is_empty() {
-            self.index.insert((span.user.clone(), span.seq), 0);
             self.spans.push(span);
             self.visible_len += span_len;
             return;
