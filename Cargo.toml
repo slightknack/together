@@ -1,0 +1,11 @@
+[package]
+name = "together"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }

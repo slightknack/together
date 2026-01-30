@@ -1,0 +1,29 @@
+#!/bin/sh
+# model = "claude-opus-4-5"
+# created = "2026-01-30"
+# modified = "2026-01-30"
+# driver = "Isaac Clayton"
+#
+# Prints the next numbered filename in a directory.
+# Usage: ./scripts/00-next-numbered directory name
+# Output: directory/01-name.md
+
+if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "usage: ./scripts/00-next-numbered directory name" >&2
+    exit 1
+fi
+
+dir="$1"
+name="$2"
+
+mkdir -p "$dir"
+
+last=$(ls "$dir" 2>/dev/null | grep -E '^[0-9]{2}-' | sed 's/^\([0-9]*\)-.*/\1/' | sort -n | tail -1)
+
+if [ -z "$last" ]; then
+    next=0
+else
+    next=$((last + 1))
+fi
+
+printf "%s/%02d-%s.md\n" "$dir" "$next" "$name"
