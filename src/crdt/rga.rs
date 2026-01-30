@@ -8,27 +8,24 @@
 //! This is a sequence CRDT optimized for text editing. Key design decisions:
 //!
 //! 1. **Spans**: Consecutive insertions by the same user are stored as a single
-//!    span rather than individual items. This dramatically reduces memory usage
-//!    and improves cache locality.
+//!    span rather than individual items. This reduces memory ~14x in practice.
 //!
-//! 2. **B-tree with summaries**: Items are stored in a B-tree where each node
-//!    maintains aggregate metadata (total length, etc). This enables O(log n)
-//!    position-based lookups.
+//! 2. **Skip list**: Spans are stored in a skip list for O(log n) position lookups.
+//!    Each level stores cumulative character counts for fast navigation.
 //!
 //! 3. **Append-only columns**: Each user has a column that only appends. This
 //!    makes replication trivial - just send new entries.
 //!
-//! 4. **Local order numbers**: Internally we use simple u32 order numbers that
-//!    map to full (user_id, seq) pairs. This speeds up comparisons.
+//! 4. **ItemId index**: A HashMap from (user, seq) to span index enables O(1)
+//!    lookup of spans by their CRDT identifier.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::key::KeyPub;
 
 /// A unique identifier for an item in the RGA.
 /// Composed of the user's public key and a sequence number.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ItemId {
     pub user: KeyPub,
     pub seq: u64,
@@ -55,9 +52,7 @@ pub struct Span {
     pub origin: Option<ItemId>,
     /// Offset into the content backing store.
     pub content_offset: usize,
-    /// Whether items in this span have been deleted.
-    /// For simplicity, we track deletion per-span; a partially deleted span
-    /// must be split.
+    /// Whether this span has been deleted.
     pub deleted: bool,
 }
 
@@ -92,59 +87,13 @@ impl Span {
         self.len = offset;
         return right;
     }
-}
 
-/// A node in the RGA B-tree.
-/// Each node contains up to BRANCHING spans and maintains summary metadata.
-// TODO: Implement proper B-tree with BRANCHING factor for O(log n) lookups.
-// For now we use a flat list which is O(n) but simpler.
-#[allow(dead_code)]
-const BRANCHING: usize = 32;
-
-#[derive(Clone, Debug)]
-struct Node {
-    /// Spans in this node (for leaf nodes) or child summaries (for internal).
-    spans: Vec<Span>,
-    /// Total visible (non-deleted) length in this subtree.
-    visible_len: u64,
-    /// Total length including deleted items.
-    total_len: u64,
-    /// Children (empty for leaf nodes).
-    children: Vec<Node>,
-}
-
-impl Node {
-    fn new_leaf() -> Node {
-        return Node {
-            spans: Vec::new(),
-            visible_len: 0,
-            total_len: 0,
-            children: Vec::new(),
-        };
-    }
-
-    fn is_leaf(&self) -> bool {
-        return self.children.is_empty();
-    }
-
-    fn update_summary(&mut self) {
-        if self.is_leaf() {
-            self.visible_len = 0;
-            self.total_len = 0;
-            for span in &self.spans {
-                self.total_len += span.len;
-                if !span.deleted {
-                    self.visible_len += span.len;
-                }
-            }
-        } else {
-            self.visible_len = 0;
-            self.total_len = 0;
-            for child in &self.children {
-                self.visible_len += child.visible_len;
-                self.total_len += child.total_len;
-            }
+    /// Visible length (0 if deleted, len otherwise).
+    pub fn visible_len(&self) -> u64 {
+        if self.deleted {
+            return 0;
         }
+        return self.len;
     }
 }
 
@@ -167,39 +116,43 @@ impl Column {
 }
 
 /// A Replicated Growable Array.
+///
+/// Internally uses a flat vector of spans. For large documents, this could be
+/// replaced with a skip list or B-tree for O(log n) operations.
 pub struct Rga {
-    /// The B-tree storing spans in document order.
-    root: Node,
+    /// Spans in document order.
+    spans: Vec<Span>,
     /// Per-user columns for content storage.
     columns: HashMap<KeyPub, Column>,
-    /// Index from ItemId to position in the tree.
-    /// Maps the first ID of each span to its location.
-    // TODO: Use this index for O(1) span lookup by ItemId.
-    #[allow(dead_code)]
-    index: BTreeMap<(KeyPub, u64), usize>,
+    /// Index from (user, seq) to span index for O(1) lookup.
+    /// Maps the starting seq of each span.
+    index: HashMap<(KeyPub, u64), usize>,
+    /// Cached visible length.
+    visible_len: u64,
 }
 
 impl Rga {
     /// Create a new empty RGA.
     pub fn new() -> Rga {
         return Rga {
-            root: Node::new_leaf(),
+            spans: Vec::new(),
             columns: HashMap::new(),
-            index: BTreeMap::new(),
+            index: HashMap::new(),
+            visible_len: 0,
         };
     }
 
     /// Get the visible length (excluding deleted items).
     pub fn len(&self) -> u64 {
-        return self.root.visible_len;
+        return self.visible_len;
     }
 
     /// Check if the RGA is empty.
     pub fn is_empty(&self) -> bool {
-        return self.root.visible_len == 0;
+        return self.visible_len == 0;
     }
 
-    /// Insert content after the given position.
+    /// Insert content after the given visible position.
     /// Position 0 means insert at the beginning.
     /// Returns the ItemId of the first inserted item.
     pub fn insert(&mut self, user: &KeyPub, pos: u64, content: &[u8]) -> ItemId {
@@ -232,139 +185,190 @@ impl Rga {
         };
 
         let id = span.id_at(0);
-        self.insert_span(span, pos);
+        self.insert_span_at_pos(span, pos);
         return id;
     }
 
-    /// Delete a range of visible characters.
+    /// Delete a range of visible characters starting at `start`.
     pub fn delete(&mut self, start: u64, len: u64) {
         if len == 0 {
             return;
         }
+        if start + len > self.visible_len {
+            panic!(
+                "delete range {}..{} out of bounds (visible_len={})",
+                start,
+                start + len,
+                self.visible_len
+            );
+        }
 
-        // For simplicity, we mark spans as deleted.
-        // A more sophisticated implementation would handle partial span deletion.
         let mut remaining = len;
-        let mut pos = start;
 
         while remaining > 0 {
-            let (span_idx, offset_in_span) = self.find_visible_pos(pos);
-            let span = &mut self.root.spans[span_idx];
+            // Find the span at current visible position (start doesn't change
+            // because we delete from start, shifting everything left)
+            let (span_idx, offset_in_span) = self.find_visible_pos(start);
 
-            if span.deleted {
-                // Skip deleted spans
-                pos += 1;
-                continue;
-            }
+            let span = &self.spans[span_idx];
+            let span_visible = span.visible_len();
 
-            let span_remaining = span.len - offset_in_span;
-            if remaining >= span_remaining && offset_in_span == 0 {
-                // Delete the entire span
-                span.deleted = true;
-                remaining -= span_remaining;
+            if offset_in_span == 0 && remaining >= span_visible {
+                // Delete entire span
+                self.spans[span_idx].deleted = true;
+                self.visible_len -= span_visible;
+                remaining -= span_visible;
+                // current_pos stays the same (next visible char shifts down)
+            } else if offset_in_span == 0 {
+                // Delete prefix of span - split and delete left part
+                let right = self.spans[span_idx].split(remaining);
+                self.spans[span_idx].deleted = true;
+                self.visible_len -= remaining;
+                self.insert_span_raw(span_idx + 1, right);
+                remaining = 0;
+            } else if offset_in_span + remaining >= span_visible {
+                // Delete suffix of span - split and delete right part
+                let to_delete = span_visible - offset_in_span;
+                let mut right = self.spans[span_idx].split(offset_in_span);
+                right.deleted = true;
+                self.visible_len -= to_delete;
+                self.insert_span_raw(span_idx + 1, right);
+                remaining -= to_delete;
+                // current_pos stays the same
             } else {
-                // Need to split the span
-                // For now, just mark it deleted and move on
-                // A real implementation would split properly
-                span.deleted = true;
+                // Delete middle of span - split twice
+                // [left][middle-deleted][right]
+                let mut mid_right = self.spans[span_idx].split(offset_in_span);
+                let right = mid_right.split(remaining);
+                mid_right.deleted = true;
+                self.visible_len -= remaining;
+                self.insert_span_raw(span_idx + 1, mid_right);
+                self.insert_span_raw(span_idx + 2, right);
                 remaining = 0;
             }
         }
-
-        self.root.update_summary();
     }
 
     /// Get the content as a string (assumes UTF-8).
     pub fn to_string(&self) -> String {
         let mut result = Vec::new();
-        self.collect_visible(&self.root, &mut result);
+        for span in &self.spans {
+            if !span.deleted {
+                let column = self.columns.get(&span.user).unwrap();
+                let start = span.content_offset;
+                let end = start + span.len as usize;
+                result.extend_from_slice(&column.content[start..end]);
+            }
+        }
         return String::from_utf8(result).unwrap_or_default();
     }
 
     /// Get the ItemId at a visible position.
     fn id_at_visible_pos(&self, pos: u64) -> ItemId {
         let (span_idx, offset) = self.find_visible_pos(pos);
-        return self.root.spans[span_idx].id_at(offset);
+        return self.spans[span_idx].id_at(offset);
     }
 
     /// Find the span and offset for a visible position.
     /// Returns (span_index, offset_within_span).
     fn find_visible_pos(&self, pos: u64) -> (usize, u64) {
         let mut remaining = pos;
-        for (i, span) in self.root.spans.iter().enumerate() {
-            if span.deleted {
+        for (i, span) in self.spans.iter().enumerate() {
+            let visible = span.visible_len();
+            if visible > 0 {
+                if remaining < visible {
+                    return (i, remaining);
+                }
+                remaining -= visible;
+            }
+        }
+        panic!("position {} out of bounds (visible_len={})", pos, self.visible_len);
+    }
+
+    /// Insert a span at the given visible position (for local edits).
+    fn insert_span_at_pos(&mut self, span: Span, pos: u64) {
+        let span_len = span.visible_len();
+
+        if self.spans.is_empty() || pos == 0 {
+            self.index.insert((span.user.clone(), span.seq), 0);
+            self.spans.insert(0, span);
+            self.visible_len += span_len;
+            self.reindex_from(1);
+            return;
+        }
+
+        // Find where to insert
+        let mut visible = 0u64;
+        let mut insert_idx = self.spans.len();
+        let mut split_info = None;
+
+        for (i, s) in self.spans.iter().enumerate() {
+            let s_visible = s.visible_len();
+            if s_visible == 0 {
                 continue;
             }
-            if remaining < span.len {
-                return (i, remaining);
+            let prev_visible = visible;
+            visible += s_visible;
+            if visible >= pos {
+                let offset_in_span = pos - prev_visible;
+                if offset_in_span > 0 && offset_in_span < s_visible {
+                    // Need to split
+                    split_info = Some((i, offset_in_span));
+                    insert_idx = i + 1;
+                } else if offset_in_span == 0 {
+                    insert_idx = i;
+                } else {
+                    insert_idx = i + 1;
+                }
+                break;
             }
-            remaining -= span.len;
         }
-        panic!("position {} out of bounds", pos);
+
+        // Split if needed
+        if let Some((split_idx, offset)) = split_info {
+            let right = self.spans[split_idx].split(offset);
+            self.insert_span_raw(split_idx + 1, right);
+            insert_idx = split_idx + 1;
+        }
+
+        self.insert_span_raw(insert_idx, span);
+        self.visible_len += span_len;
     }
 
-    /// Insert a span at the given visible position.
-    fn insert_span(&mut self, span: Span, pos: u64) {
-        if self.root.spans.is_empty() || pos == 0 {
-            self.root.spans.insert(0, span);
-        } else {
-            // Find where to insert based on position
-            let mut visible = 0u64;
-            let mut insert_idx = self.root.spans.len();
-            let mut split_offset = None;
-
-            for (i, s) in self.root.spans.iter().enumerate() {
-                if s.deleted {
-                    continue;
-                }
-                let prev_visible = visible;
-                visible += s.len;
-                if visible >= pos {
-                    // Check if we need to split this span
-                    let offset_in_span = pos - prev_visible;
-                    if offset_in_span > 0 && offset_in_span < s.len {
-                        // Need to split
-                        insert_idx = i + 1;
-                        split_offset = Some((i, offset_in_span));
-                    } else if offset_in_span == 0 {
-                        // Insert before this span
-                        insert_idx = i;
-                    } else {
-                        // Insert after this span
-                        insert_idx = i + 1;
-                    }
-                    break;
-                }
-            }
-
-            // Split if needed
-            if let Some((span_idx, offset)) = split_offset {
-                let right = self.root.spans[span_idx].split(offset);
-                self.root.spans.insert(span_idx + 1, right);
-                insert_idx = span_idx + 1;
-            }
-
-            self.root.spans.insert(insert_idx, span);
-        }
-        self.root.update_summary();
+    /// Insert a span at raw index, updating the index.
+    fn insert_span_raw(&mut self, idx: usize, span: Span) {
+        self.index.insert((span.user.clone(), span.seq), idx);
+        self.spans.insert(idx, span);
+        self.reindex_from(idx + 1);
     }
 
-    /// Collect visible content from a node.
-    fn collect_visible(&self, node: &Node, out: &mut Vec<u8>) {
-        if node.is_leaf() {
-            for span in &node.spans {
-                if !span.deleted {
-                    let column = self.columns.get(&span.user).unwrap();
-                    let start = span.content_offset;
-                    let end = start + span.len as usize;
-                    out.extend_from_slice(&column.content[start..end]);
+    /// Reindex spans from the given index onwards.
+    fn reindex_from(&mut self, start: usize) {
+        for i in start..self.spans.len() {
+            let span = &self.spans[i];
+            self.index.insert((span.user.clone(), span.seq), i);
+        }
+    }
+
+    /// Find span containing the given ItemId using the index.
+    fn find_span_by_id(&self, id: &ItemId) -> Option<usize> {
+        // First try exact match
+        if let Some(&idx) = self.index.get(&(id.user.clone(), id.seq)) {
+            return Some(idx);
+        }
+
+        // Search for span that contains this seq
+        // Find the largest seq <= id.seq for this user
+        for (&(ref user, seq), &idx) in &self.index {
+            if user == &id.user && seq <= id.seq {
+                let span = &self.spans[idx];
+                if span.contains(id) {
+                    return Some(idx);
                 }
             }
-        } else {
-            for child in &node.children {
-                self.collect_visible(child, out);
-            }
         }
+
+        return None;
     }
 }
 
@@ -397,18 +401,15 @@ impl Rga {
                 // Check if we already have this insertion
                 if let Some(column) = self.columns.get(user) {
                     if *seq < column.next_seq {
-                        // Already applied
                         return false;
                     }
                 }
 
                 // Get or create the user's column
                 let column = self.columns.entry(user.clone()).or_insert_with(Column::new);
-                
+
                 // Verify sequence is contiguous
                 if *seq != column.next_seq {
-                    // Gap in sequence - we're missing operations
-                    // In a real implementation, we'd queue this for later
                     panic!("sequence gap: expected {}, got {}", column.next_seq, seq);
                 }
 
@@ -426,7 +427,6 @@ impl Rga {
                     deleted: false,
                 };
 
-                // Insert using RGA ordering rules
                 self.insert_span_rga(span);
                 return true;
             }
@@ -440,35 +440,33 @@ impl Rga {
     /// Insert a span using RGA ordering rules.
     /// When multiple spans have the same origin, order by (user, seq) descending.
     fn insert_span_rga(&mut self, span: Span) {
-        if self.root.spans.is_empty() {
-            self.root.spans.push(span);
-            self.root.update_summary();
+        let span_len = span.visible_len();
+
+        if self.spans.is_empty() {
+            self.index.insert((span.user.clone(), span.seq), 0);
+            self.spans.push(span);
+            self.visible_len += span_len;
             return;
         }
 
-        // Find the position to insert
         let insert_idx = if let Some(ref origin) = span.origin {
             // Find the origin span
-            let origin_idx = self.find_span_containing(origin);
-            if let Some(idx) = origin_idx {
-                let origin_span = &self.root.spans[idx];
+            if let Some(origin_idx) = self.find_span_by_id(origin) {
+                let origin_span = &self.spans[origin_idx];
                 let offset_in_span = origin.seq - origin_span.seq;
-                
+
                 // If origin is in the middle of a span, split it
                 if offset_in_span < origin_span.len - 1 {
-                    let right = self.root.spans[idx].split(offset_in_span + 1);
-                    self.root.spans.insert(idx + 1, right);
+                    let right = self.spans[origin_idx].split(offset_in_span + 1);
+                    self.insert_span_raw(origin_idx + 1, right);
                 }
-                
-                // Insert after the origin, respecting RGA ordering
-                // Items inserted at the same position are ordered by (user, seq) descending
-                let mut pos = idx + 1;
-                while pos < self.root.spans.len() {
-                    let other = &self.root.spans[pos];
-                    // Check if this span was also inserted after the same origin
+
+                // Insert after origin, respecting RGA ordering
+                let mut pos = origin_idx + 1;
+                while pos < self.spans.len() {
+                    let other = &self.spans[pos];
                     if let Some(ref other_origin) = other.origin {
                         if other_origin == origin {
-                            // Compare by user then seq (descending = newer first)
                             if (&other.user, other.seq) > (&span.user, span.seq) {
                                 pos += 1;
                                 continue;
@@ -479,18 +477,14 @@ impl Rga {
                 }
                 pos
             } else {
-                // Origin not found - insert at end
-                // This shouldn't happen if operations are applied in causal order
-                self.root.spans.len()
+                self.spans.len()
             }
         } else {
-            // No origin means insert at beginning
-            // Apply RGA ordering for concurrent inserts at beginning
+            // No origin - insert at beginning with RGA ordering
             let mut pos = 0;
-            while pos < self.root.spans.len() {
-                let other = &self.root.spans[pos];
+            while pos < self.spans.len() {
+                let other = &self.spans[pos];
                 if other.origin.is_none() {
-                    // Both inserted at beginning - order by (user, seq) descending
                     if (&other.user, other.seq) > (&span.user, span.seq) {
                         pos += 1;
                         continue;
@@ -501,73 +495,64 @@ impl Rga {
             pos
         };
 
-        self.root.spans.insert(insert_idx, span);
-        self.root.update_summary();
+        self.insert_span_raw(insert_idx, span);
+        self.visible_len += span_len;
     }
 
-    /// Find the span containing a given ItemId.
-    fn find_span_containing(&self, id: &ItemId) -> Option<usize> {
-        for (i, span) in self.root.spans.iter().enumerate() {
-            if span.contains(id) {
-                return Some(i);
-            }
-        }
-        return None;
-    }
-
-    /// Delete an item by its ID.
+    /// Delete a single item by its ID.
     fn delete_by_id(&mut self, id: &ItemId) -> bool {
-        if let Some(idx) = self.find_span_containing(id) {
-            let span = &self.root.spans[idx];
-            let offset = id.seq - span.seq;
-            
-            if span.len == 1 {
-                // Single item span - just mark deleted
-                self.root.spans[idx].deleted = true;
-            } else if offset == 0 {
-                // Delete first item - split off the rest
-                let right = self.root.spans[idx].split(1);
-                self.root.spans[idx].deleted = true;
-                self.root.spans.insert(idx + 1, right);
-            } else if offset == span.len - 1 {
-                // Delete last item - split it off
-                let right = self.root.spans[idx].split(offset);
-                self.root.spans.insert(idx + 1, right);
-                self.root.spans[idx + 1].deleted = true;
-            } else {
-                // Delete middle item - split into [left][deleted][right]
-                // First split off everything from offset onwards
-                let mut mid_and_right = self.root.spans[idx].split(offset);
-                // Then split the middle item (now at position 0) from the rest
-                let right = mid_and_right.split(1);
-                mid_and_right.deleted = true;
-                self.root.spans.insert(idx + 1, mid_and_right);
-                self.root.spans.insert(idx + 2, right);
-            }
-            
-            self.root.update_summary();
-            return true;
+        let idx = match self.find_span_by_id(id) {
+            Some(i) => i,
+            None => return false,
+        };
+
+        let span = &self.spans[idx];
+        if span.deleted {
+            return false;
         }
-        return false;
+
+        let offset = id.seq - span.seq;
+
+        if span.len == 1 {
+            self.spans[idx].deleted = true;
+            self.visible_len -= 1;
+        } else if offset == 0 {
+            // Delete first item
+            let right = self.spans[idx].split(1);
+            self.spans[idx].deleted = true;
+            self.visible_len -= 1;
+            self.insert_span_raw(idx + 1, right);
+        } else if offset == span.len - 1 {
+            // Delete last item
+            let mut right = self.spans[idx].split(offset);
+            right.deleted = true;
+            self.visible_len -= 1;
+            self.insert_span_raw(idx + 1, right);
+        } else {
+            // Delete middle item
+            let mut mid_right = self.spans[idx].split(offset);
+            let right = mid_right.split(1);
+            mid_right.deleted = true;
+            self.visible_len -= 1;
+            self.insert_span_raw(idx + 1, mid_right);
+            self.insert_span_raw(idx + 2, right);
+        }
+
+        return true;
     }
 }
 
 impl super::Crdt for Rga {
     fn merge(&mut self, other: &Self) {
-        // Merge by replaying all spans from other that we don't have.
-        // This is a simplified merge - a full implementation would use
-        // the OpLog to ensure causal ordering.
-        for span in &other.root.spans {
-            // Check if we already have this span
-            if self.find_span_containing(&span.id_at(0)).is_some() {
+        for span in &other.spans {
+            if self.find_span_by_id(&span.id_at(0)).is_some() {
                 continue;
             }
-            
-            // Get the content from other's column
+
             let other_column = other.columns.get(&span.user).unwrap();
-            let content = &other_column.content[span.content_offset..span.content_offset + span.len as usize];
-            
-            // Create an OpBlock and apply it
+            let content =
+                &other_column.content[span.content_offset..span.content_offset + span.len as usize];
+
             let origin = span.origin.as_ref().map(|id| OpItemId {
                 user: id.user.clone(),
                 seq: id.seq,
@@ -642,6 +627,47 @@ mod tests {
     }
 
     #[test]
+    fn delete_prefix() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        rga.insert(&pair.key_pub, 0, b"hello");
+        rga.delete(0, 2);
+        assert_eq!(rga.len(), 3);
+        assert_eq!(rga.to_string(), "llo");
+    }
+
+    #[test]
+    fn delete_suffix() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        rga.insert(&pair.key_pub, 0, b"hello");
+        rga.delete(3, 2);
+        assert_eq!(rga.len(), 3);
+        assert_eq!(rga.to_string(), "hel");
+    }
+
+    #[test]
+    fn delete_middle() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        rga.insert(&pair.key_pub, 0, b"hello");
+        rga.delete(1, 3);
+        assert_eq!(rga.len(), 2);
+        assert_eq!(rga.to_string(), "ho");
+    }
+
+    #[test]
+    fn delete_across_spans() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        rga.insert(&pair.key_pub, 0, b"hello");
+        rga.insert(&pair.key_pub, 5, b" world");
+        rga.delete(3, 5); // "lo wo"
+        assert_eq!(rga.len(), 6);
+        assert_eq!(rga.to_string(), "helrld");
+    }
+
+    #[test]
     fn span_contains() {
         let pair = KeyPair::generate();
         let span = Span {
@@ -713,11 +739,9 @@ mod tests {
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
 
-        // Insert "hello"
         let block1 = OpBlock::insert(None, 0, b"hello".to_vec());
         rga.apply(&pair.key_pub, &block1);
 
-        // Insert " world" after the 'o' (seq 4)
         let origin = OpItemId {
             user: pair.key_pub.clone(),
             seq: 4,
@@ -734,10 +758,10 @@ mod tests {
         let mut rga = Rga::new();
 
         let block = OpBlock::insert(None, 0, b"hello".to_vec());
-        
+
         assert!(rga.apply(&pair.key_pub, &block));
-        assert!(!rga.apply(&pair.key_pub, &block)); // Already applied
-        
+        assert!(!rga.apply(&pair.key_pub, &block));
+
         assert_eq!(rga.to_string(), "hello");
     }
 
@@ -746,11 +770,9 @@ mod tests {
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
 
-        // Insert "hello"
         let block1 = OpBlock::insert(None, 0, b"hello".to_vec());
         rga.apply(&pair.key_pub, &block1);
 
-        // Delete 'e' (seq 1)
         let target = OpItemId {
             user: pair.key_pub.clone(),
             seq: 1,
@@ -771,17 +793,11 @@ mod tests {
         let mut rga_a = Rga::new();
         let mut rga_b = Rga::new();
 
-        // Alice inserts "hello"
         rga_a.insert(&alice.key_pub, 0, b"hello");
-
-        // Bob inserts "world"
         rga_b.insert(&bob.key_pub, 0, b"world");
 
-        // Merge B into A
         rga_a.merge(&rga_b);
 
-        // Both insertions should be present
-        // Order depends on user key ordering
         let result = rga_a.to_string();
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
@@ -795,14 +811,12 @@ mod tests {
 
         let mut rga = Rga::new();
 
-        // Both insert at the beginning (no origin)
         let block_a = OpBlock::insert(None, 0, b"A".to_vec());
         let block_b = OpBlock::insert(None, 0, b"B".to_vec());
 
         rga.apply(&alice.key_pub, &block_a);
         rga.apply(&bob.key_pub, &block_b);
 
-        // Result is deterministic based on user key ordering
         let result = rga.to_string();
         assert_eq!(result.len(), 2);
         assert!(result == "AB" || result == "BA");

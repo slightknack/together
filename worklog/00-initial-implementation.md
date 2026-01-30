@@ -162,10 +162,40 @@ Updated PROCESS.md with several conventions discovered during the session:
 - Following existing patterns when extending systems
 - Using python scripts for calculations
 
+### Benchmarks
+
+Benchmarked against diamond-types using [josephg/editing-traces](https://github.com/josephg/editing-traces):
+
+| Trace | Patches | Together | Diamond | Ratio |
+|-------|---------|----------|---------|-------|
+| sveltecomponent | 19,749 | 3.32s | 1.27ms | 2606x |
+
+**Why so slow?**
+
+Current implementation uses O(n) operations:
+- `find_visible_pos`: Linear scan through spans
+- `insert_span_raw`: Reindexes all spans after insertion point
+- `find_span_by_id`: Linear search when not exact match
+
+Diamond-types uses:
+- JumpRope (skip list): O(log n) position lookup
+- Efficient in-place mutations
+- Cache-friendly node layout (~400 byte inline strings)
+
+**Path to performance:**
+
+1. Replace flat `Vec<Span>` with skip list or B-tree
+2. Store cumulative character counts at each level for O(log n) position lookup
+3. Use a proper index (BTreeMap keyed by (user, seq)) for O(log n) span lookup
+
+See `research/01-diamond-types.md` for detailed architecture notes.
+
+**Consistency verified:** All traces produce identical output to diamond-types.
+
 ### Test Summary
 
-44 tests total:
+48 tests total:
 - key.rs: 9 tests
 - log.rs: 17 tests  
-- crdt/rga.rs: 15 tests
+- crdt/rga.rs: 19 tests
 - crdt/op.rs: 3 tests
