@@ -22,6 +22,8 @@
 //! assert_eq!(doc.to_string(), "Hello");
 //! ```
 
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -124,17 +126,36 @@ pub struct AnchorRange {
     pub end: Anchor,
 }
 
-/// A version identifier for accessing historical document states.
+/// A snapshot of document state at a point in time.
 ///
-/// The implementation varies depending on the versioning strategy:
-/// - Logical: Lamport timestamp
-/// - Persistent: B-tree root reference
-/// - Checkpoint: Checkpoint index + operation offset
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Version {
-    /// Lamport timestamp at this version.
+/// Uses Arc for cheap cloning and structural sharing between checkpoints.
+#[derive(Clone, Debug)]
+struct Checkpoint {
+    /// The spans at this checkpoint.
+    spans: Arc<Vec<Span>>,
+    /// Cached length (sum of visible lengths).
+    len: u64,
+    /// Lamport timestamp of this checkpoint.
     lamport: u64,
 }
+
+/// A version identifier for accessing historical document states.
+///
+/// For the checkpoint approach, this holds a reference to a checkpoint
+/// snapshot, enabling O(1) access to the stored version.
+#[derive(Clone, Debug)]
+pub struct Version {
+    /// Reference to the checkpoint data.
+    checkpoint: Arc<Checkpoint>,
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.checkpoint.lamport == other.checkpoint.lamport
+    }
+}
+
+impl Eq for Version {}
 
 /// A compact reference to an origin position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +376,33 @@ pub struct Rga {
     cursor_cache: CursorCache,
     /// Lamport timestamp for versioning.
     lamport: u64,
+    /// Checkpoints for historical versions (geometrically spaced).
+    checkpoints: Vec<Arc<Checkpoint>>,
+}
+
+/// Returns the position of the first zero bit in n (1-indexed from right).
+/// For n=0, returns 1. For n=1, returns 2. For n=2, returns 1. For n=3, returns 4.
+#[inline]
+fn first_zero_bit(n: u64) -> u64 {
+    // First zero bit position = first one bit in ~n
+    // !n gives us ones where n has zeros
+    // trailing_zeros gives the position of first one in !n
+    (!n).trailing_zeros() as u64 + 1
+}
+
+/// Compute which checkpoint to delete when adding checkpoint at time n.
+/// Uses logarithmically-spaced snapshots algorithm.
+/// Returns None if no checkpoint should be deleted.
+#[inline]
+fn checkpoint_to_delete(n: u64, density: u32) -> Option<u64> {
+    if n == 0 {
+        return None;
+    }
+    let offset = first_zero_bit(n) << density;
+    if offset > n {
+        return None;
+    }
+    Some(n - offset)
 }
 
 impl Rga {
@@ -366,6 +414,7 @@ impl Rga {
             users: UserTable::new(),
             cursor_cache: CursorCache::new(),
             lamport: 0,
+            checkpoints: Vec::new(),
         };
     }
 
@@ -684,42 +733,129 @@ impl Rga {
         return self.slice(start, end);
     }
 
+    /// Create a checkpoint of the current state and apply retention policy.
+    fn create_checkpoint(&mut self) {
+        // Create snapshot of current spans
+        let spans: Vec<Span> = self.spans.iter().cloned().collect();
+        let len = self.len();
+        let lamport = self.lamport;
+        
+        let checkpoint = Arc::new(Checkpoint {
+            spans: Arc::new(spans),
+            len,
+            lamport,
+        });
+        
+        // Apply retention policy: delete old checkpoint if needed
+        // Using density=0 for minimal memory usage (logarithmic checkpoints)
+        if let Some(to_delete) = checkpoint_to_delete(lamport, 0) {
+            // Find and remove checkpoint with this lamport
+            self.checkpoints.retain(|cp| cp.lamport != to_delete);
+        }
+        
+        self.checkpoints.push(checkpoint);
+    }
+
     /// Get the current version.
     ///
     /// The version can be used with `to_string_at`, `slice_at`, and `len_at`
     /// to access historical document states.
-    pub fn version(&self) -> Version {
-        return Version {
-            lamport: self.lamport,
-        };
+    ///
+    /// This creates a checkpoint of the current state and returns a reference
+    /// to it. Checkpoints are retained with geometric spacing to bound memory.
+    pub fn version(&mut self) -> Version {
+        // Create checkpoint for current state
+        self.create_checkpoint();
+        
+        // Return reference to the checkpoint we just created
+        let checkpoint = self.checkpoints.last().unwrap().clone();
+        return Version { checkpoint };
     }
 
     /// Get the full document at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn to_string_at(&self, _version: &Version) -> String {
-        // TODO: Implement versioning on feature branches
-        // For now, just return current state
-        return self.to_string();
+    /// Uses the checkpoint stored in the version for O(n) reconstruction
+    /// where n is the document length at that version.
+    pub fn to_string_at(&self, version: &Version) -> String {
+        let checkpoint = &version.checkpoint;
+        let mut result = Vec::with_capacity(checkpoint.len as usize);
+        
+        for span in checkpoint.spans.iter() {
+            if !span.deleted {
+                let user_idx = span.user_idx as usize;
+                if user_idx < self.columns.len() {
+                    let col = &self.columns[user_idx];
+                    let start = span.content_offset as usize;
+                    let end = start + span.len as usize;
+                    if end <= col.content.len() {
+                        result.extend_from_slice(&col.content[start..end]);
+                    }
+                }
+            }
+        }
+        
+        return String::from_utf8_lossy(&result).into_owned();
     }
 
     /// Read a slice at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn slice_at(&self, start: u64, end: u64, _version: &Version) -> Option<String> {
-        // TODO: Implement versioning on feature branches
-        return self.slice(start, end);
+    /// Returns characters in range [start, end) from the checkpoint.
+    pub fn slice_at(&self, start: u64, end: u64, version: &Version) -> Option<String> {
+        let checkpoint = &version.checkpoint;
+        
+        if start > end || start > checkpoint.len {
+            return None;
+        }
+        
+        let end = end.min(checkpoint.len);
+        if start == end {
+            return Some(String::new());
+        }
+        
+        let mut result = Vec::with_capacity((end - start) as usize);
+        let mut pos: u64 = 0;
+        
+        for span in checkpoint.spans.iter() {
+            if span.deleted {
+                continue;
+            }
+            
+            let span_len = span.len as u64;
+            let span_end = pos + span_len;
+            
+            // Check if this span overlaps with our range
+            if span_end > start && pos < end {
+                let user_idx = span.user_idx as usize;
+                if user_idx < self.columns.len() {
+                    let col = &self.columns[user_idx];
+                    
+                    // Calculate the portion of this span to include
+                    let span_start_in_range = if pos < start { (start - pos) as u32 } else { 0 };
+                    let span_end_in_range = if span_end > end { span.len - (span_end - end) as u32 } else { span.len };
+                    
+                    let content_start = (span.content_offset + span_start_in_range) as usize;
+                    let content_end = (span.content_offset + span_end_in_range) as usize;
+                    
+                    if content_end <= col.content.len() {
+                        result.extend_from_slice(&col.content[content_start..content_end]);
+                    }
+                }
+            }
+            
+            pos = span_end;
+            if pos >= end {
+                break;
+            }
+        }
+        
+        return Some(String::from_utf8_lossy(&result).into_owned());
     }
 
     /// Get the document length at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn len_at(&self, _version: &Version) -> u64 {
-        // TODO: Implement versioning on feature branches
-        return self.len();
+    /// Returns the cached length from the checkpoint (O(1)).
+    pub fn len_at(&self, version: &Version) -> u64 {
+        return version.checkpoint.len;
     }
 
     /// Insert a span at the given visible position (for local edits).
