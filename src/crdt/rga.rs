@@ -202,24 +202,28 @@ impl Span {
     }
 
     /// Check if this span has an origin.
+    #[inline(always)]
     pub fn has_origin(&self) -> bool {
         return self.origin_span_idx != NO_ORIGIN;
     }
 
     /// Check if this span contains the given sequence number for the same user.
+    #[inline(always)]
     pub fn contains_seq(&self, seq: u32) -> bool {
         return seq >= self.seq && seq < self.seq + self.len;
     }
 
     /// Get the sequence number at a position within this span.
+    #[inline(always)]
     pub fn seq_at(&self, offset: u32) -> u32 {
-        assert!(offset < self.len);
+        debug_assert!(offset < self.len);
         return self.seq + offset;
     }
 
     /// Split this span at the given offset, returning the right half.
+    #[inline]
     pub fn split(&mut self, offset: u32) -> Span {
-        assert!(offset > 0 && offset < self.len);
+        debug_assert!(offset > 0 && offset < self.len);
         let right = Span {
             seq: self.seq + offset,
             len: self.len - offset,
@@ -235,6 +239,7 @@ impl Span {
     }
 
     /// Visible length (0 if deleted, len otherwise).
+    #[inline(always)]
     pub fn visible_len(&self) -> u32 {
         if self.deleted {
             return 0;
@@ -318,15 +323,21 @@ impl CursorCache {
     }
 
     /// Adjust the cache after a delete starting at the given position with the given length.
-    /// Deletes can cause span splits and reordering, which invalidates our cached span_idx
-    /// and offset_in_span. Since deletes are relatively rare compared to inserts, we simply
-    /// invalidate the cache after any delete rather than trying to track complex adjustments.
-    fn adjust_after_delete(&mut self, _delete_pos: u64, _delete_len: u64) {
-        // Deletes can split spans and change span indices, making our cached
-        // span_idx and offset_in_span potentially invalid. Rather than trying to
-        // track these complex changes, we simply invalidate the cache.
-        // This is safe because deletes are much less common than inserts in typical
-        // editing patterns, so the cost of one lookup after a delete is acceptable.
+    /// We can preserve the cache in some cases:
+    /// - If the delete is entirely AFTER the cached position, the cache is still valid
+    ///   (the span_idx and offset_in_span don't change for earlier positions)
+    /// - If the delete touches or precedes the cached position, we must invalidate
+    fn adjust_after_delete(&mut self, delete_pos: u64, _delete_len: u64) {
+        if !self.valid {
+            return;
+        }
+        // If the delete starts after our cached position, the cache is still valid
+        // because deletions after our position don't affect span indices before it
+        if delete_pos > self.visible_pos {
+            // Cache remains valid - delete is after our cached position
+            return;
+        }
+        // Delete touches or precedes cached position - must invalidate
         self.invalidate();
     }
 }

@@ -143,23 +143,28 @@ impl<T> Chunk<T> {
         }
     }
 
+    #[inline(always)]
     fn len(&self) -> usize {
         self.items.len()
     }
 
+    #[inline(always)]
     fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
+    #[inline(always)]
     fn should_split(&self) -> bool {
         self.items.len() >= MAX_CHUNK_SIZE
     }
 
+    #[inline]
     fn insert(&mut self, index: usize, item: T, weight: u64) {
         self.items.insert(index, (item, weight));
         self.total_weight += weight;
     }
 
+    #[inline]
     fn remove(&mut self, index: usize) -> (T, u64) {
         let (item, weight) = self.items.remove(index);
         self.total_weight -= weight;
@@ -178,6 +183,7 @@ impl<T> Chunk<T> {
     }
 
     /// Find item by weight within this chunk.
+    #[inline]
     fn find_by_weight(&self, pos: u64) -> Option<(usize, u64)> {
         let mut cumulative = 0u64;
         for (i, (_, weight)) in self.items.iter().enumerate() {
@@ -189,14 +195,17 @@ impl<T> Chunk<T> {
         None
     }
 
+    #[inline(always)]
     fn get(&self, index: usize) -> Option<&T> {
         self.items.get(index).map(|(item, _)| item)
     }
 
+    #[inline(always)]
     fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.items.get_mut(index).map(|(item, _)| item)
     }
 
+    #[inline]
     fn update_weight(&mut self, index: usize, new_weight: u64) -> u64 {
         let old_weight = self.items[index].1;
         self.items[index].1 = new_weight;
@@ -326,6 +335,7 @@ impl<T> WeightedList<T> {
 
     /// Find the item containing the given weight position.
     /// Returns (item_index, offset_within_item) or None if pos >= total_weight.
+    #[inline]
     pub fn find_by_weight(&self, pos: u64) -> Option<(usize, u64)> {
         if pos >= self.total_weight {
             return None;
@@ -374,6 +384,7 @@ impl<T> WeightedList<T> {
         }
     }
 
+    #[inline]
     pub fn get(&self, index: usize) -> Option<&T> {
         if index >= self.len {
             return None;
@@ -382,6 +393,7 @@ impl<T> WeightedList<T> {
         self.chunks[chunk_idx].get(idx_in_chunk)
     }
 
+    #[inline]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index >= self.len {
             return None;

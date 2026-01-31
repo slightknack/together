@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "quick_bench"
 harness = false
+
+[[bench]]
+name = "profile_bench"
+harness = false
