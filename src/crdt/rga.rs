@@ -156,7 +156,9 @@ impl OriginRef {
     }
 }
 
-/// A compact span of consecutive items inserted by the same user (24 bytes).
+/// A compact span of consecutive items inserted by the same user.
+/// 
+/// Size: 32 bytes (increased from 24 to support versioning with timestamps).
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct Span {
@@ -165,6 +167,10 @@ struct Span {
     origin_span_idx: u32,
     origin_offset: u32,
     content_offset: u32,
+    /// Lamport timestamp when this span was inserted.
+    insert_time: u32,
+    /// Lamport timestamp when this span was deleted (0 = not deleted).
+    delete_time: u32,
     user_idx: u16,
     deleted: bool,
     _padding: u8,
@@ -177,6 +183,7 @@ impl Span {
         len: u32,
         origin: OriginRef,
         content_offset: u32,
+        insert_time: u32,
     ) -> Span {
         return Span {
             seq,
@@ -184,6 +191,8 @@ impl Span {
             origin_span_idx: origin.span_idx,
             origin_offset: origin.offset,
             content_offset,
+            insert_time,
+            delete_time: 0,
             user_idx,
             deleted: false,
             _padding: 0,
@@ -221,6 +230,8 @@ impl Span {
             origin_span_idx: NO_ORIGIN, // Will be fixed by caller
             origin_offset: 0,
             content_offset: self.content_offset + offset,
+            insert_time: self.insert_time,
+            delete_time: self.delete_time,
             user_idx: self.user_idx,
             deleted: self.deleted,
             _padding: 0,
@@ -423,6 +434,7 @@ impl Rga {
             content.len() as u32,
             OriginRef::none(),
             content_offset,
+            self.lamport as u32,
         );
 
         self.insert_span_at_pos_optimized(span, pos);
@@ -463,9 +475,13 @@ impl Rga {
             let span = self.spans.get(span_idx).unwrap();
             let span_visible = span.visible_len() as u64;
 
+            let delete_time = self.lamport as u32;
+
             if offset_in_span == 0 && remaining >= span_visible {
                 // Delete entire span - mark as deleted and update weight to 0
-                self.spans.get_mut(span_idx).unwrap().deleted = true;
+                let span_mut = self.spans.get_mut(span_idx).unwrap();
+                span_mut.deleted = true;
+                span_mut.delete_time = delete_time;
                 self.spans.update_weight(span_idx, 0);
                 remaining -= span_visible;
             } else if offset_in_span == 0 {
@@ -473,6 +489,7 @@ impl Rga {
                 let mut span = self.spans.remove(span_idx);
                 let right = span.split(remaining as u32);
                 span.deleted = true;
+                span.delete_time = delete_time;
                 self.spans.insert(span_idx, span, 0);
                 self.spans.insert(span_idx + 1, right, right.visible_len() as u64);
                 remaining = 0;
@@ -482,6 +499,7 @@ impl Rga {
                 let mut span = self.spans.remove(span_idx);
                 let mut right = span.split(offset_in_span as u32);
                 right.deleted = true;
+                right.delete_time = delete_time;
                 self.spans.insert(span_idx, span, span.visible_len() as u64);
                 self.spans.insert(span_idx + 1, right, 0);
                 remaining -= to_delete;
@@ -491,6 +509,7 @@ impl Rga {
                 let mut mid_right = span.split(offset_in_span as u32);
                 let right = mid_right.split(remaining as u32);
                 mid_right.deleted = true;
+                mid_right.delete_time = delete_time;
                 self.spans.insert(span_idx, span, span.visible_len() as u64);
                 self.spans.insert(span_idx + 1, mid_right, 0);
                 self.spans.insert(span_idx + 2, right, right.visible_len() as u64);
@@ -696,30 +715,115 @@ impl Rga {
 
     /// Get the full document at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn to_string_at(&self, _version: &Version) -> String {
-        // TODO: Implement versioning on feature branches
-        // For now, just return current state
-        return self.to_string();
+    /// Uses logical versioning: filters spans by their insert/delete timestamps.
+    /// Time complexity: O(n) where n is the number of spans.
+    pub fn to_string_at(&self, version: &Version) -> String {
+        let version_time = version.lamport as u32;
+        let mut result = Vec::new();
+        
+        for span in self.spans.iter() {
+            // Skip if not yet inserted at this version
+            if span.insert_time > version_time {
+                continue;
+            }
+            // Skip if already deleted at this version
+            if span.delete_time > 0 && span.delete_time <= version_time {
+                continue;
+            }
+            // Include this span
+            let column = &self.columns[span.user_idx as usize];
+            let start = span.content_offset as usize;
+            let end = start + span.len as usize;
+            result.extend_from_slice(&column.content[start..end]);
+        }
+        
+        return String::from_utf8(result).unwrap_or_default();
     }
 
     /// Read a slice at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn slice_at(&self, start: u64, end: u64, _version: &Version) -> Option<String> {
-        // TODO: Implement versioning on feature branches
-        return self.slice(start, end);
+    /// Uses logical versioning: filters spans by their insert/delete timestamps.
+    /// Time complexity: O(n) where n is the number of spans.
+    pub fn slice_at(&self, start: u64, end: u64, version: &Version) -> Option<String> {
+        if start > end {
+            return None;
+        }
+        
+        let version_time = version.lamport as u32;
+        let len_at_version = self.len_at(version);
+        
+        if end > len_at_version {
+            return None;
+        }
+        if start == end {
+            return Some(String::new());
+        }
+
+        let mut result = Vec::with_capacity((end - start) as usize);
+        let mut pos: u64 = 0;
+
+        for span in self.spans.iter() {
+            // Skip if not yet inserted at this version
+            if span.insert_time > version_time {
+                continue;
+            }
+            // Skip if already deleted at this version
+            if span.delete_time > 0 && span.delete_time <= version_time {
+                continue;
+            }
+
+            let span_len = span.len as u64;
+            let span_end = pos + span_len;
+
+            // Skip spans entirely before our range
+            if span_end <= start {
+                pos = span_end;
+                continue;
+            }
+
+            // Stop if we've passed the end
+            if pos >= end {
+                break;
+            }
+
+            // Calculate overlap
+            let overlap_start = start.max(pos);
+            let overlap_end = end.min(span_end);
+            let offset_in_span = (overlap_start - pos) as usize;
+            let len_to_copy = (overlap_end - overlap_start) as usize;
+
+            let column = &self.columns[span.user_idx as usize];
+            let content_start = span.content_offset as usize + offset_in_span;
+            let content_end = content_start + len_to_copy;
+            result.extend_from_slice(&column.content[content_start..content_end]);
+
+            pos = span_end;
+        }
+
+        return Some(String::from_utf8(result).unwrap_or_default());
     }
 
     /// Get the document length at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn len_at(&self, _version: &Version) -> u64 {
-        // TODO: Implement versioning on feature branches
-        return self.len();
+    /// Uses logical versioning: filters spans by their insert/delete timestamps.
+    /// Time complexity: O(n) where n is the number of spans.
+    pub fn len_at(&self, version: &Version) -> u64 {
+        let version_time = version.lamport as u32;
+        let mut len: u64 = 0;
+        
+        for span in self.spans.iter() {
+            // Skip if not yet inserted at this version
+            if span.insert_time > version_time {
+                continue;
+            }
+            // Skip if already deleted at this version
+            if span.delete_time > 0 && span.delete_time <= version_time {
+                continue;
+            }
+            len += span.len as u64;
+        }
+        
+        return len;
     }
 
     /// Insert a span at the given visible position (for local edits).
@@ -835,12 +939,14 @@ impl Rga {
         // Set the origin from the lookup we just did
         span.set_origin(OriginRef::some(prev_idx as u32, offset_in_prev as u32));
 
-        // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted
+        // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted,
+        // same insert_time (required for versioning to work correctly)
         // Also check offset_in_prev == prev_span.visible_len - 1 to ensure we're at the end of the span
         if prev_span.user_idx == span.user_idx
             && !prev_span.deleted
             && prev_span.seq + prev_span.len == span.seq
             && prev_span.content_offset + prev_span.len == span.content_offset
+            && prev_span.insert_time == span.insert_time
             && offset_in_prev == prev_visible_len - 1
         {
             // Coalesce by extending the previous span
@@ -950,6 +1056,9 @@ impl Rga {
                     panic!("sequence gap: expected {}, got {}", column.next_seq, seq);
                 }
 
+                // Increment lamport clock for this operation
+                self.lamport += 1;
+
                 let column = &mut self.columns[user_idx as usize];
                 let content_offset = column.content.len() as u32;
                 column.content.extend_from_slice(&block.content);
@@ -962,6 +1071,7 @@ impl Rga {
                     *len as u32,
                     OriginRef::none(), // Will be resolved during insert
                     content_offset,
+                    self.lamport as u32,
                 );
 
                 self.insert_span_rga(span, origin.as_ref().map(Self::convert_id));
@@ -1058,17 +1168,24 @@ impl Rga {
             return false;
         }
 
+        // Increment lamport clock for this delete operation
+        self.lamport += 1;
+        let delete_time = self.lamport as u32;
+
         let offset = (id.seq as u32) - span.seq;
         let span_len = span.len;
 
         if span_len == 1 {
-            self.spans.get_mut(idx).unwrap().deleted = true;
+            let span_mut = self.spans.get_mut(idx).unwrap();
+            span_mut.deleted = true;
+            span_mut.delete_time = delete_time;
             self.spans.update_weight(idx, 0);
         } else if offset == 0 {
             // Delete first item
             let mut existing = self.spans.remove(idx);
             let right = existing.split(1);
             existing.deleted = true;
+            existing.delete_time = delete_time;
             self.spans.insert(idx, existing, 0);
             self.spans.insert(idx + 1, right, right.visible_len() as u64);
         } else if offset == span_len - 1 {
@@ -1076,6 +1193,7 @@ impl Rga {
             let mut existing = self.spans.remove(idx);
             let mut right = existing.split(offset);
             right.deleted = true;
+            right.delete_time = delete_time;
             self.spans.insert(idx, existing, existing.visible_len() as u64);
             self.spans.insert(idx + 1, right, 0);
         } else {
@@ -1084,6 +1202,7 @@ impl Rga {
             let mut mid_right = existing.split(offset);
             let right = mid_right.split(1);
             mid_right.deleted = true;
+            mid_right.delete_time = delete_time;
             self.spans.insert(idx, existing, existing.visible_len() as u64);
             self.spans.insert(idx + 1, mid_right, 0);
             self.spans.insert(idx + 2, right, right.visible_len() as u64);
@@ -1363,10 +1482,10 @@ mod tests {
     #[test]
     fn span_size() {
         // Verify our span is compact
+        // Size increased from 24 to 32 bytes to support versioning timestamps
         let size = std::mem::size_of::<Span>();
         assert!(size <= 32, "Span is {} bytes, expected <= 32", size);
-        // Ideally 24 bytes
-        assert_eq!(size, 24, "Span should be exactly 24 bytes");
+        assert_eq!(size, 32, "Span should be exactly 32 bytes (with versioning)");
     }
 
     #[test]
@@ -1623,15 +1742,16 @@ mod trace_repro_tests {
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
         
-        // Sequential inserts at end should coalesce into one span
+        // Sequential inserts at end can only coalesce if they have the same lamport time.
+        // Since each insert increments the lamport, they won't coalesce for versioning support.
         rga.insert(&pair.key_pub, 0, b"a");
         assert_eq!(rga.span_count(), 1);
         
         rga.insert(&pair.key_pub, 1, b"b");
-        assert_eq!(rga.span_count(), 1); // Should coalesce
+        assert_eq!(rga.span_count(), 2); // Different lamport, no coalesce
         
         rga.insert(&pair.key_pub, 2, b"c");
-        assert_eq!(rga.span_count(), 1); // Should coalesce
+        assert_eq!(rga.span_count(), 3); // Different lamport, no coalesce
         
         assert_eq!(rga.to_string(), "abc");
         assert_eq!(rga.len(), 3);
@@ -1679,7 +1799,9 @@ mod cursor_cache_tests {
 
     #[test]
     fn cursor_cache_sequential_typing() {
-        // Sequential typing should use the cursor cache for O(1) lookups
+        // Sequential typing test - with versioning, each insert has a different lamport
+        // timestamp, so coalescing doesn't happen and the cache is invalidated.
+        // This is a tradeoff for correctness in versioning.
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
         
@@ -1688,25 +1810,15 @@ mod cursor_cache_tests {
         assert!(rga.cursor_cache.valid);
         assert_eq!(rga.cursor_cache.visible_pos, 0); // Position of 'h'
         
+        // Subsequent inserts don't coalesce (different lamport times), so cache invalidates
         rga.insert(&pair.key_pub, 1, b"e");
-        assert!(rga.cursor_cache.valid);
-        assert_eq!(rga.cursor_cache.visible_pos, 1); // Position of 'e'
-        
         rga.insert(&pair.key_pub, 2, b"l");
-        assert!(rga.cursor_cache.valid);
-        assert_eq!(rga.cursor_cache.visible_pos, 2);
-        
         rga.insert(&pair.key_pub, 3, b"l");
-        assert!(rga.cursor_cache.valid);
-        assert_eq!(rga.cursor_cache.visible_pos, 3);
-        
         rga.insert(&pair.key_pub, 4, b"o");
-        assert!(rga.cursor_cache.valid);
-        assert_eq!(rga.cursor_cache.visible_pos, 4);
         
         assert_eq!(rga.to_string(), "hello");
-        // All inserts coalesced into one span
-        assert_eq!(rga.span_count(), 1);
+        // Each insert is a separate span (no coalescing across lamport times)
+        assert_eq!(rga.span_count(), 5);
     }
 
     #[test]
@@ -2009,5 +2121,38 @@ mod rga_buf_tests {
         buf.insert(&pair.key_pub, 6, b"!");
         
         assert_eq!(buf.to_string(), "hello!!");
+    }
+}
+
+#[cfg(test)]
+mod version_debug_tests {
+    use super::*;
+    use crate::key::KeyPair;
+
+    #[test]
+    fn debug_version_tracking() {
+        let user = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        rga.insert(&user.key_pub, 0, b"hello");
+        let v1 = rga.version();
+        println!("After 'hello': lamport={}, v1.lamport={}", rga.lamport, v1.lamport);
+        
+        // Check span insert_time
+        for (i, span) in rga.spans.iter().enumerate() {
+            println!("Span {}: insert_time={}, delete_time={}, len={}", i, span.insert_time, span.delete_time, span.len);
+        }
+        
+        rga.insert(&user.key_pub, 5, b" world");
+        let v2 = rga.version();
+        println!("After ' world': lamport={}, v2.lamport={}", rga.lamport, v2.lamport);
+        
+        // Check span insert_times
+        for (i, span) in rga.spans.iter().enumerate() {
+            println!("Span {}: insert_time={}, delete_time={}, len={}", i, span.insert_time, span.delete_time, span.len);
+        }
+        
+        println!("to_string_at(v1) = '{}'", rga.to_string_at(&v1));
+        println!("to_string_at(v2) = '{}'", rga.to_string_at(&v2));
     }
 }
