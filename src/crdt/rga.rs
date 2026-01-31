@@ -845,7 +845,7 @@ impl Rga {
 struct PendingInsert {
     /// The user performing the insert.
     user_idx: u16,
-    /// The starting position of the buffered insert.
+    /// The starting position.
     pos: u64,
     /// The accumulated content bytes.
     content: Vec<u8>,
@@ -856,6 +856,9 @@ struct PendingInsert {
 /// Text editing traces show strong locality: sequential typing inserts at
 /// positions P, P+1, P+2, etc. By buffering these adjacent inserts and
 /// applying them as a single operation, we can significantly reduce overhead.
+///
+/// This wrapper also optimizes:
+/// - Backspace at end of pending insert: trim buffer instead of flush+delete
 ///
 /// JumpRopeBuf (used by diamond-types) achieves ~10x speedup for sequential
 /// editing patterns using this technique.
@@ -883,8 +886,10 @@ impl RgaBuf {
     /// Flush any pending operation to the underlying RGA.
     pub fn flush(&mut self) {
         if let Some(pending) = self.pending.take() {
-            let user = self.rga.users.get_key(pending.user_idx).unwrap().clone();
-            self.rga.insert(&user, pending.pos, &pending.content);
+            if !pending.content.is_empty() {
+                let user = self.rga.users.get_key(pending.user_idx).unwrap().clone();
+                self.rga.insert(&user, pending.pos, &pending.content);
+            }
         }
     }
 
@@ -900,11 +905,12 @@ impl RgaBuf {
 
         let user_idx = self.rga.ensure_user(user);
 
-        // Check if we can extend the pending insert
+        // Check if we can extend a pending insert
         if let Some(ref mut pending) = self.pending {
-            // Same user and adjacent position (inserting right after pending content)?
-            if pending.user_idx == user_idx && pos == pending.pos + pending.content.len() as u64 {
-                // Extend the pending insert
+            if pending.user_idx == user_idx
+                && pos == pending.pos + pending.content.len() as u64
+            {
+                // Same user and adjacent position - extend the pending insert
                 pending.content.extend_from_slice(content);
                 return;
             }
@@ -921,11 +927,33 @@ impl RgaBuf {
 
     /// Delete a range of visible characters.
     ///
-    /// Flushes any pending insert first, then performs the delete.
+    /// Optimized for backspace at end of pending insert: trim the buffer
+    /// instead of flushing and performing a full delete operation.
     pub fn delete(&mut self, start: u64, len: u64) {
         if len == 0 {
             return;
         }
+
+        // Check if we can trim a pending insert instead of doing a full delete
+        if let Some(ref mut pending) = self.pending {
+            let pending_end = pending.pos + pending.content.len() as u64;
+
+            // Backspace at end of pending insert
+            // Example: typed "hello" at pos 0, now delete at pos 4, len 1
+            // This deletes 'o' which is still in the buffer
+            if start + len == pending_end && start >= pending.pos {
+                // The delete is entirely within the pending insert, at the end
+                let trim_start = (start - pending.pos) as usize;
+                pending.content.truncate(trim_start);
+                // If we've trimmed everything, remove the pending op
+                if pending.content.is_empty() {
+                    self.pending = None;
+                }
+                return;
+            }
+        }
+
+        // Can't optimize - flush any pending operation and perform the delete
         self.flush();
         self.rga.delete(start, len);
     }
