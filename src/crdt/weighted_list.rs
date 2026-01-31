@@ -183,14 +183,15 @@ impl<T> Chunk<T> {
     }
 
     /// Find item by weight within this chunk.
-    #[inline]
+    #[inline(always)]
     fn find_by_weight(&self, pos: u64) -> Option<(usize, u64)> {
         let mut cumulative = 0u64;
         for (i, (_, weight)) in self.items.iter().enumerate() {
-            if cumulative + weight > pos {
+            let next = cumulative + weight;
+            if next > pos {
                 return Some((i, pos - cumulative));
             }
-            cumulative += weight;
+            cumulative = next;
         }
         None
     }
@@ -269,6 +270,7 @@ impl<T> WeightedList<T> {
     /// Find the chunk containing the given weight position.
     /// Returns (chunk_index, weight_offset_in_chunk, items_before_chunk).
     /// Uses linear scan for small chunk counts, Fenwick tree for larger counts.
+    #[inline]
     fn find_chunk_by_weight(&self, pos: u64) -> Option<(usize, u64, usize)> {
         if pos >= self.total_weight {
             return None;
@@ -292,10 +294,11 @@ impl<T> WeightedList<T> {
             let mut weight_before = 0u64;
             let mut items_before = 0usize;
             for (idx, chunk) in self.chunks.iter().enumerate() {
-                if weight_before + chunk.total_weight > pos {
+                let next_weight = weight_before + chunk.total_weight;
+                if next_weight > pos {
                     return Some((idx, pos - weight_before, items_before));
                 }
-                weight_before += chunk.total_weight;
+                weight_before = next_weight;
                 items_before += chunk.len();
             }
             return None;
@@ -305,6 +308,7 @@ impl<T> WeightedList<T> {
     /// Find the chunk containing the given index.
     /// Returns (chunk_index, index_within_chunk).
     /// Uses linear scan for small chunk counts, Fenwick tree for larger counts.
+    #[inline]
     fn find_chunk_by_index(&self, index: usize) -> (usize, usize) {
         if index >= self.len {
             // Insert at end
@@ -322,10 +326,11 @@ impl<T> WeightedList<T> {
             // Linear scan for small chunk counts - O(n) but with good constants
             let mut items_before = 0usize;
             for (idx, chunk) in self.chunks.iter().enumerate() {
-                if items_before + chunk.len() > index {
+                let next_items = items_before + chunk.len();
+                if next_items > index {
                     return (idx, index - items_before);
                 }
-                items_before += chunk.len();
+                items_before = next_items;
             }
             // Should not reach here if index < self.len
             let last = self.chunks.len().saturating_sub(1);
@@ -433,6 +438,65 @@ impl<T> WeightedList<T> {
         }
         
         return Some(new_weight);
+    }
+
+    /// Get a reference to an item using cached chunk location.
+    /// This bypasses find_chunk_by_index for O(1) access when the cache is valid.
+    /// The caller must ensure chunk_idx and idx_in_chunk are valid.
+    #[inline]
+    pub fn get_with_chunk_hint(&self, chunk_idx: usize, idx_in_chunk: usize) -> Option<&T> {
+        self.chunks.get(chunk_idx)?.get(idx_in_chunk)
+    }
+
+    /// Modify an item and update its weight using cached chunk location.
+    /// This bypasses find_chunk_by_index for O(1) access when the cache is valid.
+    /// Returns (new_weight, new_chunk_idx, new_idx_in_chunk) on success.
+    /// The chunk location may change if the modification triggers a split.
+    #[inline]
+    pub fn modify_and_update_weight_with_hint<F>(
+        &mut self,
+        chunk_idx: usize,
+        idx_in_chunk: usize,
+        f: F,
+    ) -> Option<(u64, usize, usize)>
+    where
+        F: FnOnce(&mut T) -> u64,
+    {
+        let chunk = self.chunks.get_mut(chunk_idx)?;
+        let (item, old_weight) = chunk.items.get_mut(idx_in_chunk)?;
+        let old = *old_weight;
+        
+        // Call the callback to modify the item and get the new weight
+        let new_weight = f(item);
+        
+        // Update weights
+        *old_weight = new_weight;
+        chunk.total_weight = chunk.total_weight - old + new_weight;
+        self.total_weight = self.total_weight - old + new_weight;
+        
+        // Update Fenwick tree with the weight delta (only if using Fenwick)
+        if self.use_fenwick {
+            let delta = new_weight as i64 - old as i64;
+            self.chunk_weights.update(chunk_idx, delta);
+        }
+        
+        // Return the new weight and chunk location (unchanged since we didn't split)
+        return Some((new_weight, chunk_idx, idx_in_chunk));
+    }
+
+    /// Find by weight and return chunk location along with item info.
+    /// Returns (item_index, offset_in_item, chunk_idx, idx_in_chunk).
+    #[inline]
+    pub fn find_by_weight_with_chunk(&self, pos: u64) -> Option<(usize, u64, usize, usize)> {
+        if pos >= self.total_weight {
+            return None;
+        }
+
+        let (chunk_idx, offset_in_chunk, items_before) = self.find_chunk_by_weight(pos)?;
+        let chunk = &self.chunks[chunk_idx];
+        let (idx_in_chunk, offset_in_item) = chunk.find_by_weight(offset_in_chunk)?;
+
+        Some((items_before + idx_in_chunk, offset_in_item, chunk_idx, idx_in_chunk))
     }
 
     /// Update the weight of an item at the given index.
