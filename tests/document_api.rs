@@ -303,7 +303,6 @@ fn version_basic() {
 }
 
 #[test]
-#[ignore = "requires versioning implementation on feature branches"]
 fn version_tracks_changes() {
     let mut rga = Rga::new();
     
@@ -318,7 +317,6 @@ fn version_tracks_changes() {
 }
 
 #[test]
-#[ignore = "requires versioning implementation on feature branches"]
 fn version_with_deletes() {
     let mut rga = Rga::new();
     
@@ -337,7 +335,6 @@ fn version_with_deletes() {
 }
 
 #[test]
-#[ignore = "requires versioning implementation on feature branches"]
 fn version_slice_at() {
     let mut rga = Rga::new();
     
@@ -355,7 +352,6 @@ fn version_slice_at() {
 }
 
 #[test]
-#[ignore = "requires versioning implementation on feature branches"]
 fn version_len_at() {
     let mut rga = Rga::new();
     
@@ -401,7 +397,6 @@ fn scenario_collaborative_editing() {
 }
 
 #[test]
-#[ignore = "requires versioning implementation on feature branches"]
 fn scenario_undo_preview() {
     let mut rga = Rga::new();
     

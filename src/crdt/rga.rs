@@ -22,6 +22,8 @@
 //! assert_eq!(doc.to_string(), "Hello");
 //! ```
 
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -124,17 +126,36 @@ pub struct AnchorRange {
     pub end: Anchor,
 }
 
+/// A snapshot of document state at a point in time.
+///
+/// Uses Arc for cheap cloning and structural sharing.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    /// The spans at this version.
+    spans: Vec<Span>,
+    /// Cached length (sum of visible lengths).
+    len: u64,
+}
+
 /// A version identifier for accessing historical document states.
 ///
-/// The implementation varies depending on the versioning strategy:
-/// - Logical: Lamport timestamp
-/// - Persistent: B-tree root reference
-/// - Checkpoint: Checkpoint index + operation offset
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// For the persistent approach, this holds a reference-counted snapshot
+/// of the document state, enabling O(1) access to historical versions.
+#[derive(Clone, Debug)]
 pub struct Version {
-    /// Lamport timestamp at this version.
+    /// The snapshot at this version.
+    snapshot: Arc<Snapshot>,
+    /// Lamport timestamp for ordering.
     lamport: u64,
 }
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.lamport == other.lamport
+    }
+}
+
+impl Eq for Version {}
 
 /// A compact reference to an origin position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -688,38 +709,105 @@ impl Rga {
     ///
     /// The version can be used with `to_string_at`, `slice_at`, and `len_at`
     /// to access historical document states.
+    ///
+    /// This creates a snapshot of the current document state. The snapshot
+    /// is reference-counted, so taking multiple versions is cheap if the
+    /// document hasn't changed.
     pub fn version(&self) -> Version {
+        // Create a snapshot of current spans
+        let spans: Vec<Span> = self.spans.iter().cloned().collect();
+        let len = self.len();
+        
         return Version {
+            snapshot: Arc::new(Snapshot { spans, len }),
             lamport: self.lamport,
         };
     }
 
     /// Get the full document at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn to_string_at(&self, _version: &Version) -> String {
-        // TODO: Implement versioning on feature branches
-        // For now, just return current state
-        return self.to_string();
+    /// Uses the snapshot stored in the version for O(n) reconstruction
+    /// where n is the document length at that version.
+    pub fn to_string_at(&self, version: &Version) -> String {
+        let snapshot = &version.snapshot;
+        let mut result = Vec::with_capacity(snapshot.len as usize);
+        
+        for span in &snapshot.spans {
+            if !span.deleted {
+                let user_idx = span.user_idx as usize;
+                if user_idx < self.columns.len() {
+                    let col = &self.columns[user_idx];
+                    let start = span.content_offset as usize;
+                    let end = start + span.len as usize;
+                    if end <= col.content.len() {
+                        result.extend_from_slice(&col.content[start..end]);
+                    }
+                }
+            }
+        }
+        
+        return String::from_utf8_lossy(&result).into_owned();
     }
 
     /// Read a slice at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn slice_at(&self, start: u64, end: u64, _version: &Version) -> Option<String> {
-        // TODO: Implement versioning on feature branches
-        return self.slice(start, end);
+    /// Returns characters in range [start, end) from the snapshot.
+    pub fn slice_at(&self, start: u64, end: u64, version: &Version) -> Option<String> {
+        let snapshot = &version.snapshot;
+        
+        if start > end || start > snapshot.len {
+            return None;
+        }
+        
+        let end = end.min(snapshot.len);
+        if start == end {
+            return Some(String::new());
+        }
+        
+        let mut result = Vec::with_capacity((end - start) as usize);
+        let mut pos: u64 = 0;
+        
+        for span in &snapshot.spans {
+            if span.deleted {
+                continue;
+            }
+            
+            let span_len = span.len as u64;
+            let span_end = pos + span_len;
+            
+            // Check if this span overlaps with our range
+            if span_end > start && pos < end {
+                let user_idx = span.user_idx as usize;
+                if user_idx < self.columns.len() {
+                    let col = &self.columns[user_idx];
+                    
+                    // Calculate the portion of this span to include
+                    let span_start_in_range = if pos < start { (start - pos) as u32 } else { 0 };
+                    let span_end_in_range = if span_end > end { span.len - (span_end - end) as u32 } else { span.len };
+                    
+                    let content_start = (span.content_offset + span_start_in_range) as usize;
+                    let content_end = (span.content_offset + span_end_in_range) as usize;
+                    
+                    if content_end <= col.content.len() {
+                        result.extend_from_slice(&col.content[content_start..content_end]);
+                    }
+                }
+            }
+            
+            pos = span_end;
+            if pos >= end {
+                break;
+            }
+        }
+        
+        return Some(String::from_utf8_lossy(&result).into_owned());
     }
 
     /// Get the document length at a specific version.
     ///
-    /// Note: The current implementation on main branch only supports
-    /// the current version. Full versioning is implemented on feature branches.
-    pub fn len_at(&self, _version: &Version) -> u64 {
-        // TODO: Implement versioning on feature branches
-        return self.len();
+    /// Returns the cached length from the snapshot (O(1)).
+    pub fn len_at(&self, version: &Version) -> u64 {
+        return version.snapshot.len;
     }
 
     /// Insert a span at the given visible position (for local edits).
