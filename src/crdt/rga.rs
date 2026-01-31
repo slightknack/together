@@ -168,25 +168,18 @@ impl Rga {
         column.content.extend_from_slice(content);
         column.next_seq += content.len() as u64;
 
-        // Find the origin (the item we're inserting after)
-        let origin = if pos == 0 {
-            None
-        } else {
-            Some(self.id_at_visible_pos(pos - 1))
-        };
-
-        // Create the span
+        // Create the span (origin is set during insert_span_at_pos_optimized)
         let span = Span {
-            user: user.clone(),
+            user: *user,
             seq,
             len: content.len() as u64,
-            origin,
+            origin: None, // Will be set during insert if needed
             content_offset,
             deleted: false,
         };
 
         let id = span.id_at(0);
-        self.insert_span_at_pos(span, pos);
+        self.insert_span_at_pos_optimized(span, pos);
         return id;
     }
 
@@ -275,42 +268,80 @@ impl Rga {
     }
 
     /// Insert a span at the given visible position (for local edits).
+    /// Optimized version that sets the origin during insert to avoid double lookup.
     /// Attempts to coalesce with the preceding span if possible.
-    fn insert_span_at_pos(&mut self, span: Span, pos: u64) {
+    fn insert_span_at_pos_optimized(&mut self, mut span: Span, pos: u64) {
         let span_len = span.visible_len();
 
         if self.spans.is_empty() {
+            // No origin for first span
             self.spans.insert(0, span, span_len);
             return;
         }
 
-        // Try to coalesce with the span ending at this position
-        if pos > 0 {
-            // Find the span containing the character just before our insert position
-            if let Some((prev_idx, offset_in_prev)) = self.spans.find_by_weight(pos - 1) {
-                let prev_span = self.spans.get(prev_idx).unwrap();
-                
-                // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted
-                // Also check offset_in_prev == prev_span.len - 1 to ensure we're at the end of the span
-                if prev_span.user == span.user
-                    && !prev_span.deleted
-                    && prev_span.seq + prev_span.len == span.seq
-                    && prev_span.content_offset + prev_span.len as usize == span.content_offset
-                    && offset_in_prev == prev_span.visible_len() - 1
-                {
-                    // Coalesce by extending the previous span
-                    let prev_span = self.spans.get_mut(prev_idx).unwrap();
-                    prev_span.len += span.len;
-                    // Update weight
-                    let new_weight = prev_span.visible_len();
-                    self.spans.update_weight(prev_idx, new_weight);
-                    return;
-                }
-            }
+        if pos == 0 {
+            // No origin when inserting at beginning
+            self.spans.insert(0, span, span_len);
+            return;
         }
 
-        // Can't coalesce, insert as new span
-        if pos == 0 {
+        // Find the span containing the character just before our insert position
+        // This single lookup serves: origin lookup, coalescing check, and insert position
+        let (prev_idx, offset_in_prev) = match self.spans.find_by_weight(pos - 1) {
+            Some(result) => result,
+            None => {
+                // pos >= total_weight + 1, insert at end (shouldn't normally happen)
+                self.spans.insert(self.spans.len(), span, span_len);
+                return;
+            }
+        };
+
+        let prev_span = self.spans.get(prev_idx).unwrap();
+        let prev_visible_len = prev_span.visible_len();
+        
+        // Set the origin from the lookup we just did
+        span.origin = Some(prev_span.id_at(offset_in_prev));
+
+        // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted
+        // Also check offset_in_prev == prev_span.visible_len - 1 to ensure we're at the end of the span
+        if prev_span.user == span.user
+            && !prev_span.deleted
+            && prev_span.seq + prev_span.len == span.seq
+            && prev_span.content_offset + prev_span.len as usize == span.content_offset
+            && offset_in_prev == prev_visible_len - 1
+        {
+            // Coalesce by extending the previous span
+            let prev_span = self.spans.get_mut(prev_idx).unwrap();
+            prev_span.len += span.len;
+            // Update weight
+            let new_weight = prev_span.visible_len();
+            self.spans.update_weight(prev_idx, new_weight);
+            return;
+        }
+
+        // Can't coalesce - determine insert position based on the lookup we already did
+        // If offset_in_prev is at the end of prev_span, insert after it
+        // Otherwise we need to split prev_span
+        if offset_in_prev == prev_visible_len - 1 {
+            // Insert right after prev_span
+            self.spans.insert(prev_idx + 1, span, span_len);
+        } else {
+            // Need to split prev_span - insert in the middle
+            let split_offset = offset_in_prev + 1;
+            let mut existing = self.spans.remove(prev_idx);
+            let right = existing.split(split_offset);
+            self.spans.insert(prev_idx, existing, existing.visible_len());
+            self.spans.insert(prev_idx + 1, span, span_len);
+            self.spans.insert(prev_idx + 2, right, right.visible_len());
+        }
+    }
+
+    /// Insert a span at the given visible position (for local edits).
+    /// Used by RGA apply for remote operations where origin is already set.
+    fn insert_span_at_pos(&mut self, span: Span, pos: u64) {
+        let span_len = span.visible_len();
+
+        if self.spans.is_empty() || pos == 0 {
             self.spans.insert(0, span, span_len);
             return;
         }

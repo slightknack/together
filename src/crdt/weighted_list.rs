@@ -153,7 +153,7 @@ impl<T> WeightedList<T> {
 
     /// Find the item containing the given weight position.
     /// Returns (item_index, offset_within_item) or None if pos >= total_weight.
-    pub fn find_by_weight(&mut self, pos: u64) -> Option<(usize, u64)> {
+    pub fn find_by_weight(&self, pos: u64) -> Option<(usize, u64)> {
         if pos >= self.total_weight {
             return None;
         }
