@@ -13,7 +13,7 @@ use std::time::Instant;
 use flate2::bufread::GzDecoder;
 use serde::Deserialize;
 
-use together::crdt::rga::Rga;
+use together::crdt::rga::RgaBuf;
 use together::key::KeyPair;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,7 +57,7 @@ impl TestData {
 
 fn replay_together(data: &TestData) -> String {
     let pair = KeyPair::generate();
-    let mut rga = Rga::new();
+    let mut rga = RgaBuf::new();
 
     for txn in &data.txns {
         for TestPatch(pos, del, ins) in &txn.patches {
@@ -104,7 +104,7 @@ fn main() {
         let data = TestData::load(path);
         println!("{}: {} patches", name, data.patch_count());
 
-        // Together
+        // Together (buffered)
         let start = Instant::now();
         let together_result = replay_together(&data);
         let together_time = start.elapsed();

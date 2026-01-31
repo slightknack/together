@@ -838,6 +838,151 @@ impl Rga {
     }
 }
 
+// --- Buffered wrapper for batching adjacent operations ---
+
+/// A pending insert operation waiting to be flushed.
+#[derive(Clone, Debug)]
+struct PendingInsert {
+    /// The user performing the insert.
+    user_idx: u16,
+    /// The starting position of the buffered insert.
+    pos: u64,
+    /// The accumulated content bytes.
+    content: Vec<u8>,
+}
+
+/// A buffered wrapper around Rga that batches adjacent operations.
+///
+/// Text editing traces show strong locality: sequential typing inserts at
+/// positions P, P+1, P+2, etc. By buffering these adjacent inserts and
+/// applying them as a single operation, we can significantly reduce overhead.
+///
+/// JumpRopeBuf (used by diamond-types) achieves ~10x speedup for sequential
+/// editing patterns using this technique.
+///
+/// Usage:
+/// - Use `insert` and `delete` as normal
+/// - Call `flush` before any read operation (len, to_string)
+/// - The wrapper automatically flushes when switching users or positions
+pub struct RgaBuf {
+    /// The underlying RGA.
+    rga: Rga,
+    /// Pending insert operation, if any.
+    pending: Option<PendingInsert>,
+}
+
+impl RgaBuf {
+    /// Create a new buffered RGA wrapper.
+    pub fn new() -> RgaBuf {
+        return RgaBuf {
+            rga: Rga::new(),
+            pending: None,
+        };
+    }
+
+    /// Flush any pending operation to the underlying RGA.
+    pub fn flush(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            let user = self.rga.users.get_key(pending.user_idx).unwrap().clone();
+            self.rga.insert(&user, pending.pos, &pending.content);
+        }
+    }
+
+    /// Insert content at the given position.
+    ///
+    /// If this insert is adjacent to a pending insert by the same user,
+    /// the content is buffered. Otherwise, the pending insert is flushed
+    /// and a new pending insert is started.
+    pub fn insert(&mut self, user: &KeyPub, pos: u64, content: &[u8]) {
+        if content.is_empty() {
+            return;
+        }
+
+        let user_idx = self.rga.ensure_user(user);
+
+        // Check if we can extend the pending insert
+        if let Some(ref mut pending) = self.pending {
+            // Same user and adjacent position (inserting right after pending content)?
+            if pending.user_idx == user_idx && pos == pending.pos + pending.content.len() as u64 {
+                // Extend the pending insert
+                pending.content.extend_from_slice(content);
+                return;
+            }
+        }
+
+        // Can't extend - flush any pending operation and start a new one
+        self.flush();
+        self.pending = Some(PendingInsert {
+            user_idx,
+            pos,
+            content: content.to_vec(),
+        });
+    }
+
+    /// Delete a range of visible characters.
+    ///
+    /// Flushes any pending insert first, then performs the delete.
+    pub fn delete(&mut self, start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        self.flush();
+        self.rga.delete(start, len);
+    }
+
+    /// Get the visible length (excluding deleted items).
+    ///
+    /// Flushes any pending operation first.
+    pub fn len(&mut self) -> u64 {
+        self.flush();
+        return self.rga.len();
+    }
+
+    /// Check if the RGA is empty.
+    ///
+    /// Flushes any pending operation first.
+    pub fn is_empty(&mut self) -> bool {
+        self.flush();
+        return self.rga.is_empty();
+    }
+
+    /// Get the content as a string.
+    ///
+    /// Flushes any pending operation first.
+    pub fn to_string(&mut self) -> String {
+        self.flush();
+        return self.rga.to_string();
+    }
+
+    /// Get the number of spans (for profiling).
+    ///
+    /// Flushes any pending operation first.
+    pub fn span_count(&mut self) -> usize {
+        self.flush();
+        return self.rga.span_count();
+    }
+
+    /// Get a reference to the underlying RGA.
+    ///
+    /// WARNING: Does not flush. Use only when you know there are no pending ops.
+    pub fn inner(&self) -> &Rga {
+        return &self.rga;
+    }
+
+    /// Get a mutable reference to the underlying RGA.
+    ///
+    /// WARNING: Does not flush. Use only when you know there are no pending ops.
+    pub fn inner_mut(&mut self) -> &mut Rga {
+        return &mut self.rga;
+    }
+}
+
+impl Default for RgaBuf {
+    fn default() -> Self {
+        return Self::new();
+    }
+}
+
 impl super::Crdt for Rga {
     fn merge(&mut self, other: &Self) {
         for span in other.spans.iter() {
@@ -1379,5 +1524,149 @@ mod cursor_cache_tests {
         // Continue typing
         rga.insert(&pair.key_pub, 5, b"!");
         assert_eq!(rga.to_string(), "hellp!");
+    }
+}
+
+#[cfg(test)]
+mod rga_buf_tests {
+    use super::*;
+    use crate::key::KeyPair;
+
+    #[test]
+    fn basic_insert() {
+        let pair = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        buf.insert(&pair.key_pub, 0, b"hello");
+        assert_eq!(buf.to_string(), "hello");
+    }
+
+    #[test]
+    fn sequential_inserts_buffered() {
+        let pair = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        // Sequential typing: h, e, l, l, o
+        buf.insert(&pair.key_pub, 0, b"h");
+        buf.insert(&pair.key_pub, 1, b"e");
+        buf.insert(&pair.key_pub, 2, b"l");
+        buf.insert(&pair.key_pub, 3, b"l");
+        buf.insert(&pair.key_pub, 4, b"o");
+        
+        // Should be buffered, not yet in RGA
+        assert!(buf.pending.is_some());
+        assert_eq!(buf.pending.as_ref().unwrap().content, b"hello");
+        
+        // Flush and verify
+        assert_eq!(buf.to_string(), "hello");
+        assert!(buf.pending.is_none());
+    }
+
+    #[test]
+    fn non_sequential_flushes() {
+        let pair = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        // Insert at position 0
+        buf.insert(&pair.key_pub, 0, b"world");
+        
+        // Insert at position 0 again (not adjacent) - should flush previous
+        buf.insert(&pair.key_pub, 0, b"hello ");
+        
+        // Verify the previous insert was flushed
+        assert_eq!(buf.to_string(), "hello world");
+    }
+
+    #[test]
+    fn delete_flushes_pending() {
+        let pair = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        buf.insert(&pair.key_pub, 0, b"hello");
+        // Delete should flush pending first
+        buf.delete(2, 2); // Delete "ll"
+        
+        assert_eq!(buf.to_string(), "heo");
+    }
+
+    #[test]
+    fn different_user_flushes() {
+        let alice = KeyPair::generate();
+        let bob = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        buf.insert(&alice.key_pub, 0, b"alice");
+        // Different user should flush
+        buf.insert(&bob.key_pub, 5, b"bob");
+        
+        assert_eq!(buf.to_string(), "alicebob");
+    }
+
+    #[test]
+    fn empty_content_ignored() {
+        let pair = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        buf.insert(&pair.key_pub, 0, b"hello");
+        buf.insert(&pair.key_pub, 5, b""); // Empty - should be ignored
+        
+        // Pending should still be "hello"
+        assert!(buf.pending.is_some());
+        assert_eq!(buf.pending.as_ref().unwrap().content, b"hello");
+    }
+
+    #[test]
+    fn len_flushes() {
+        let pair = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        buf.insert(&pair.key_pub, 0, b"hello");
+        assert!(buf.pending.is_some());
+        
+        let len = buf.len();
+        assert_eq!(len, 5);
+        assert!(buf.pending.is_none()); // Flushed
+    }
+
+    #[test]
+    fn complex_editing_pattern() {
+        let pair = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        // Type "hello"
+        buf.insert(&pair.key_pub, 0, b"h");
+        buf.insert(&pair.key_pub, 1, b"e");
+        buf.insert(&pair.key_pub, 2, b"l");
+        buf.insert(&pair.key_pub, 3, b"l");
+        buf.insert(&pair.key_pub, 4, b"o");
+        
+        // Type " world"
+        buf.insert(&pair.key_pub, 5, b" ");
+        buf.insert(&pair.key_pub, 6, b"w");
+        buf.insert(&pair.key_pub, 7, b"o");
+        buf.insert(&pair.key_pub, 8, b"r");
+        buf.insert(&pair.key_pub, 9, b"l");
+        buf.insert(&pair.key_pub, 10, b"d");
+        
+        assert_eq!(buf.to_string(), "hello world");
+    }
+
+    #[test]
+    fn backspace_then_continue() {
+        let pair = KeyPair::generate();
+        let mut buf = RgaBuf::new();
+        
+        // Type "helllo" (typo with extra 'l')
+        buf.insert(&pair.key_pub, 0, b"helllo");
+        
+        // Backspace to delete the extra 'l' at position 3
+        // "helllo" -> "hello"
+        buf.delete(3, 1);
+        
+        // Continue typing at end (position 5)
+        buf.insert(&pair.key_pub, 5, b"!");
+        buf.insert(&pair.key_pub, 6, b"!");
+        
+        assert_eq!(buf.to_string(), "hello!!");
     }
 }
