@@ -22,8 +22,7 @@
 //!    - Storing origin as span_idx + offset (u32 + u32)
 //!    - Using u32 for seq/len/content_offset
 
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::key::KeyPub;
@@ -37,7 +36,7 @@ const NO_ORIGIN: u32 = u32::MAX;
 #[derive(Clone, Debug, Default)]
 pub struct UserTable {
     /// Map from KeyPub to index.
-    key_to_idx: HashMap<KeyPub, u16>,
+    key_to_idx: FxHashMap<KeyPub, u16>,
     /// Map from index to KeyPub.
     idx_to_key: Vec<KeyPub>,
 }
@@ -46,7 +45,7 @@ impl UserTable {
     /// Create a new empty user table.
     pub fn new() -> UserTable {
         return UserTable {
-            key_to_idx: HashMap::new(),
+            key_to_idx: FxHashMap::default(),
             idx_to_key: Vec::new(),
         };
     }
@@ -680,7 +679,11 @@ impl Rga {
             // Insert right after prev_span
             self.spans.insert(prev_idx + 1, span, span_len);
             
-            // Invalidate cache - chunk indices may have changed due to insert/split
+            // Update cache to point to end of newly inserted span
+            // This allows the next sequential insert to use the cache
+            // Note: We don't know the exact leaf location after insert (it may have split),
+            // so we just invalidate and let the next lookup rebuild the cache.
+            // A more sophisticated approach would track the new location.
             self.cursor_cache.invalidate();
         } else {
             // Need to split prev_span - insert in the middle

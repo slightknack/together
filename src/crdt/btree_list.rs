@@ -282,6 +282,7 @@ impl<T: Clone> BTreeList<T> {
 
     /// Find the leaf containing the given weight position.
     /// Returns (leaf_idx, offset_in_leaf, items_before_leaf).
+    #[inline]
     fn find_leaf_by_weight(&self, pos: u64) -> Option<(LeafIdx, u64, usize)> {
         if pos >= self.total_weight {
             return None;
@@ -315,6 +316,7 @@ impl<T: Clone> BTreeList<T> {
 
     /// Find the leaf containing the given item index.
     /// Returns (leaf_idx, index_in_leaf).
+    #[inline]
     fn find_leaf_by_index(&self, index: usize) -> (LeafIdx, usize) {
         if index >= self.len {
             // For insert at end
@@ -377,6 +379,27 @@ impl<T: Clone> BTreeList<T> {
     }
 
     /// Update weight in ancestors after a leaf weight change.
+    /// Update both weight and count in ancestors after a leaf change.
+    /// This combines what would be two traversals into one.
+    #[inline]
+    fn update_ancestors(&mut self, leaf_idx: LeafIdx, weight_delta: i64, count_delta: i64) {
+        let leaf = &self.leaves[leaf_idx as usize];
+        let mut parent = leaf.parent;
+        let mut child_index = leaf.index_in_parent as usize;
+
+        while parent != NONE {
+            let node = &mut self.nodes[parent as usize];
+            node.child_weights[child_index] = (node.child_weights[child_index] as i64 + weight_delta) as u64;
+            node.total_weight = (node.total_weight as i64 + weight_delta) as u64;
+            node.child_counts[child_index] = (node.child_counts[child_index] as i64 + count_delta) as usize;
+            node.total_count = (node.total_count as i64 + count_delta) as usize;
+            child_index = node.index_in_parent as usize;
+            parent = node.parent;
+        }
+    }
+
+    /// Update weight in ancestors (count unchanged).
+    #[inline]
     fn update_ancestor_weights(&mut self, leaf_idx: LeafIdx, delta: i64) {
         let leaf = &self.leaves[leaf_idx as usize];
         let mut parent = leaf.parent;
@@ -386,21 +409,6 @@ impl<T: Clone> BTreeList<T> {
             let node = &mut self.nodes[parent as usize];
             node.child_weights[child_index] = (node.child_weights[child_index] as i64 + delta) as u64;
             node.total_weight = (node.total_weight as i64 + delta) as u64;
-            child_index = node.index_in_parent as usize;
-            parent = node.parent;
-        }
-    }
-
-    /// Update count in ancestors after a leaf item count change.
-    fn update_ancestor_counts(&mut self, leaf_idx: LeafIdx, delta: i64) {
-        let leaf = &self.leaves[leaf_idx as usize];
-        let mut parent = leaf.parent;
-        let mut child_index = leaf.index_in_parent as usize;
-
-        while parent != NONE {
-            let node = &mut self.nodes[parent as usize];
-            node.child_counts[child_index] = (node.child_counts[child_index] as i64 + delta) as usize;
-            node.total_count = (node.total_count as i64 + delta) as usize;
             child_index = node.index_in_parent as usize;
             parent = node.parent;
         }
@@ -418,10 +426,9 @@ impl<T: Clone> BTreeList<T> {
         self.total_weight += weight;
         self.len += 1;
 
-        // Update ancestor weights and counts
+        // Update ancestor weights and counts in a single traversal
         if self.height > 0 {
-            self.update_ancestor_weights(leaf_idx, weight as i64);
-            self.update_ancestor_counts(leaf_idx, 1);
+            self.update_ancestors(leaf_idx, weight as i64, 1);
         }
 
         // Split if necessary
@@ -681,10 +688,9 @@ impl<T: Clone> BTreeList<T> {
         self.total_weight -= weight;
         self.len -= 1;
 
-        // Update ancestor weights and counts
+        // Update ancestor weights and counts in a single traversal
         if self.height > 0 {
-            self.update_ancestor_weights(leaf_idx, -(weight as i64));
-            self.update_ancestor_counts(leaf_idx, -1);
+            self.update_ancestors(leaf_idx, -(weight as i64), -1);
         }
 
         // For simplicity, we don't merge underflowed nodes in this implementation.
