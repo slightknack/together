@@ -17,7 +17,7 @@ use criterion::criterion_main;
 use flate2::bufread::GzDecoder;
 use serde::Deserialize;
 
-use together::crdt::rga::Rga;
+use together::crdt::rga::RgaBuf;
 use together::key::KeyPair;
 
 /// A single patch: (position, delete_count, insert_content)
@@ -64,7 +64,7 @@ impl TestData {
 /// Replay trace using together's RGA
 fn replay_together(data: &TestData) -> String {
     let pair = KeyPair::generate();
-    let mut rga = Rga::new();
+    let mut rga = RgaBuf::new();
 
     for txn in &data.txns {
         for TestPatch(pos, del, ins) in &txn.patches {
