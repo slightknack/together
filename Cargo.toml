@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "profile_bench"
 harness = false
+
+[[bench]]
+name = "version_bench"
+harness = false
