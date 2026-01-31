@@ -5,6 +5,7 @@
 
 //! CRDT primitives for authenticated collaborative data structures.
 
+pub mod btree_list;
 pub mod op;
 pub mod rga;
 // pub mod rope; // TODO: Fix rope skip list bugs

@@ -98,6 +98,7 @@ fn main() {
         ("sveltecomponent", "data/editing-traces/sequential_traces/ascii_only/sveltecomponent.json.gz"),
         ("rustcode", "data/editing-traces/sequential_traces/ascii_only/rustcode.json.gz"),
         ("seph-blog1", "data/editing-traces/sequential_traces/ascii_only/seph-blog1.json.gz"),
+        ("automerge-paper", "data/editing-traces/sequential_traces/ascii_only/automerge-paper.json.gz"),
     ];
 
     for (name, path) in &traces {

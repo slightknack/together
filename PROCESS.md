@@ -1,7 +1,7 @@
 ---
 model = "claude-opus-4-5"
 created = "2026-01-29"
-modified = "2026-01-30"
+modified = "2026-01-31"
 driver = "Isaac Clayton"
 ---
 
@@ -40,6 +40,8 @@ Leave the codebase better than you found it. If you see a bug, fix it. If docume
 When the driver establishes a new convention, add it to this document before continuing with other work. Conventions that live only in conversation are conventions that will be forgotten. The next context will not know what the current context learned. Writing it down is part of the work.
 
 A script is more reliable than instructions. When a process can be automated, write a script instead of documenting the steps. Instructions can be misread or forgotten. Scripts execute the same way every time. Put scripts in `scripts/NN-name`. Files in numbered directories use a two-digit prefix to establish order: `00-first`, `01-second`, `02-third`. Run `./scripts/00-next-numbered <directory> <name>` to print the next available path.
+
+A procedure is more reliable than ad-hoc work. When a process requires judgment but follows a repeatable structure, write a procedure instead of reinventing the approach each time. Procedures capture the phases, checkpoints, and quality gates that make complex work consistent. They are to multi-step human-in-the-loop processes what scripts are to automation. Put procedures in `procedures/NN-name.md`.
 
 Use ephemeral python scripts to perform calculations. Do not do arithmetic in prose. Run `python3 -c "print(...)"` to compute and verify numbers before stating them. Reason through the problem before coming to the conclusion, not after.
 
@@ -478,7 +480,11 @@ When exploring a new topic, start by searching the web for primary sources. Read
 
 Write research notes as you research, not after. The act of writing clarifies understanding and creates a record while the material is fresh. Waiting until the end means details are forgotten or conflated. If you decide to research something, open the research file first and write to it as you go.
 
-When you do research, write it up in `research/NN-topic.md`. Run `./scripts/00-next-numbered research topic-name` to get the next filename. Include sources, key insights, and how it relates to this project. Research documents are machine-managed. This creates a persistent record that future contexts can consult without re-fetching the same sources.
+When you do research, write it up in `research/NN-topic.md`. Run `./scripts/00-next-numbered research topic-name` to get the next filename. Include sources, key insights, and how it relates to this project. Research documents are machine-managed. This creates a persistent record that future contexts can consult without re-fetching the same sources. Research also includes plans, prompts, and other context-specific artifacts: optimization plans for a specific effort, prompts to continue work in a new context, analysis of a particular bug. If it is specific to a moment or task, it belongs in research.
+
+When you do extended work, log progress in `worklog/NN-session.md`. A worklog captures what was tried, what worked, what failed, and final results. Unlike research which explores a topic, a worklog records the history of a work session. This creates an audit trail for optimization efforts, debugging sessions, or multi-step implementations.
+
+When you need to repeat a complex process, document it in `procedures/NN-name.md`. Procedures capture repeatable workflows that require judgment: when to proceed, when to stop, what quality gates to check. Unlike scripts which automate, procedures guide. Procedures are general and reusable. A procedure for "how to optimize performance" belongs in procedures. A specific optimization plan for "phase 2 optimizations" belongs in research.
 
 "When you code, you get a lot of feedback, and, through trial and error, you can process the feedback to improve your skills. Repeatedly doing the same thing and noticing differences and similarities is essential to self-directed learning." [7]
 

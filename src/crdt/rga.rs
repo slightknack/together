@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use smallvec::SmallVec;
 
 use crate::key::KeyPub;
-use super::weighted_list::WeightedList;
+use super::btree_list::BTreeList;
 
 /// Sentinel value indicating no origin (insert at beginning).
 const NO_ORIGIN: u32 = u32::MAX;
@@ -359,7 +359,7 @@ impl CursorCache {
 /// list is optimized.
 pub struct Rga {
     /// Spans in document order, weighted by visible character count.
-    spans: WeightedList<Span>,
+    spans: BTreeList<Span>,
     /// Per-user columns for content storage, indexed by user_idx.
     columns: Vec<Column>,
     /// Maps KeyPub to user index.
@@ -372,7 +372,7 @@ impl Rga {
     /// Create a new empty RGA.
     pub fn new() -> Rga {
         return Rga {
-            spans: WeightedList::new(),
+            spans: BTreeList::new(),
             columns: Vec::new(),
             users: UserTable::new(),
             cursor_cache: CursorCache::new(),
