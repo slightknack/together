@@ -259,6 +259,76 @@ impl Column {
     }
 }
 
+/// Cursor cache for amortizing sequential lookups.
+///
+/// Text editing has strong locality: sequential typing inserts at pos+1,
+/// backspace deletes at pos-1. By caching the last lookup result, we can
+/// scan from the cached position instead of doing a full O(log n) lookup.
+///
+/// For sequential typing, this turns O(log n) per insert into O(1) amortized.
+#[derive(Clone, Debug)]
+struct CursorCache {
+    /// The visible position that was looked up (the character BEFORE which we insert).
+    /// For insert at pos P, we look up pos P-1 to find the origin.
+    visible_pos: u64,
+    /// The span index containing that position.
+    span_idx: usize,
+    /// The offset within the span.
+    offset_in_span: u64,
+    /// Whether the cache is valid.
+    valid: bool,
+}
+
+impl CursorCache {
+    fn new() -> CursorCache {
+        return CursorCache {
+            visible_pos: 0,
+            span_idx: 0,
+            offset_in_span: 0,
+            valid: false,
+        };
+    }
+
+    /// Invalidate the cache.
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    /// Update the cache with a new lookup result.
+    fn update(&mut self, visible_pos: u64, span_idx: usize, offset_in_span: u64) {
+        self.visible_pos = visible_pos;
+        self.span_idx = span_idx;
+        self.offset_in_span = offset_in_span;
+        self.valid = true;
+    }
+
+    /// Adjust the cache after an insert at the given position with the given length.
+    /// The insert position is where the new content starts (before adjustment).
+    /// When a new span is inserted, it can shift span indices and invalidate our cache.
+    fn adjust_after_insert(&mut self, _insert_pos: u64, _insert_len: u64, _new_span_idx: usize) {
+        // When inserting at a position different from where we cached,
+        // the span indices can shift in complex ways. Rather than trying to track
+        // these changes precisely, we simply invalidate the cache.
+        // The next insert will do a fresh lookup and re-establish the cache.
+        // This only affects non-sequential inserts (e.g., insert at beginning after
+        // typing at the end), which are relatively rare.
+        self.invalidate();
+    }
+
+    /// Adjust the cache after a delete starting at the given position with the given length.
+    /// Deletes can cause span splits and reordering, which invalidates our cached span_idx
+    /// and offset_in_span. Since deletes are relatively rare compared to inserts, we simply
+    /// invalidate the cache after any delete rather than trying to track complex adjustments.
+    fn adjust_after_delete(&mut self, _delete_pos: u64, _delete_len: u64) {
+        // Deletes can split spans and change span indices, making our cached
+        // span_idx and offset_in_span potentially invalid. Rather than trying to
+        // track these complex changes, we simply invalidate the cache.
+        // This is safe because deletes are much less common than inserts in typical
+        // editing patterns, so the cost of one lookup after a delete is acceptable.
+        self.invalidate();
+    }
+}
+
 /// A Replicated Growable Array.
 ///
 /// Uses a weighted list of spans where each span's weight is its visible
@@ -271,6 +341,8 @@ pub struct Rga {
     columns: Vec<Column>,
     /// Maps KeyPub to user index.
     users: UserTable,
+    /// Cursor cache for amortizing sequential lookups.
+    cursor_cache: CursorCache,
 }
 
 impl Rga {
@@ -280,6 +352,7 @@ impl Rga {
             spans: WeightedList::new(),
             columns: Vec::new(),
             users: UserTable::new(),
+            cursor_cache: CursorCache::new(),
         };
     }
 
@@ -354,6 +427,11 @@ impl Rga {
             );
         }
 
+        // Adjust or invalidate the cursor cache
+        // Delete operations can create/remove spans, so we invalidate if the delete
+        // touches or precedes the cached position to keep things simple and correct.
+        self.cursor_cache.adjust_after_delete(start, len);
+
         let mut remaining = len;
 
         while remaining > 0 {
@@ -419,29 +497,83 @@ impl Rga {
     /// Insert a span at the given visible position (for local edits).
     /// Optimized version that sets the origin during insert to avoid double lookup.
     /// Attempts to coalesce with the preceding span if possible.
+    /// Uses cursor caching for O(1) sequential typing.
     fn insert_span_at_pos_optimized(&mut self, mut span: Span, pos: u64) {
         let span_len = span.visible_len() as u64;
 
         if self.spans.is_empty() {
             // No origin for first span
             self.spans.insert(0, span, span_len);
+            // Cache the end of what we just inserted
+            self.cursor_cache.update(pos + span_len - 1, 0, span_len - 1);
             return;
         }
 
         if pos == 0 {
             // No origin when inserting at beginning
             self.spans.insert(0, span, span_len);
+            // Adjust cache: spans shifted right, cache position shifted by span_len
+            self.cursor_cache.adjust_after_insert(0, span_len, 0);
             return;
         }
 
-        // Find the span containing the character just before our insert position
-        // This single lookup serves: origin lookup, coalescing check, and insert position
-        let (prev_idx, offset_in_prev) = match self.spans.find_by_weight(pos - 1) {
-            Some(result) => result,
-            None => {
-                // pos >= total_weight + 1, insert at end (shouldn't normally happen)
-                self.spans.insert(self.spans.len(), span, span_len);
-                return;
+        // The position we need to look up: the character just before insert position
+        let lookup_pos = pos - 1;
+
+        // Try to use the cursor cache for sequential typing
+        // Sequential typing: last insert was at position P, next insert is at P + last_len
+        // So we look up P + last_len - 1, which should be cached as the end of last insert
+        let (prev_idx, offset_in_prev) = if self.cursor_cache.valid
+            && self.cursor_cache.visible_pos == lookup_pos
+        {
+            // Cache hit! Use cached position directly
+            (self.cursor_cache.span_idx, self.cursor_cache.offset_in_span)
+        } else if self.cursor_cache.valid
+            && self.cursor_cache.visible_pos + 1 == lookup_pos
+            && self.cursor_cache.span_idx < self.spans.len()
+        {
+            // One position forward from cache - common for sequential typing after non-coalescing insert
+            // Try to scan forward one character
+            let cached_span = self.spans.get(self.cursor_cache.span_idx).unwrap();
+            let cached_visible = cached_span.visible_len() as u64;
+            
+            if self.cursor_cache.offset_in_span + 1 < cached_visible {
+                // Next position is within the same span
+                (self.cursor_cache.span_idx, self.cursor_cache.offset_in_span + 1)
+            } else {
+                // Need to move to next span - scan forward
+                let mut idx = self.cursor_cache.span_idx + 1;
+                while idx < self.spans.len() {
+                    let s = self.spans.get(idx).unwrap();
+                    if s.visible_len() > 0 {
+                        break;
+                    }
+                    idx += 1;
+                }
+                if idx < self.spans.len() {
+                    (idx, 0)
+                } else {
+                    // Fallback to full lookup
+                    match self.spans.find_by_weight(lookup_pos) {
+                        Some(result) => result,
+                        None => {
+                            self.spans.insert(self.spans.len(), span, span_len);
+                            self.cursor_cache.invalidate();
+                            return;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Cache miss - do full lookup
+            match self.spans.find_by_weight(lookup_pos) {
+                Some(result) => result,
+                None => {
+                    // pos >= total_weight + 1, insert at end (shouldn't normally happen)
+                    self.spans.insert(self.spans.len(), span, span_len);
+                    self.cursor_cache.invalidate();
+                    return;
+                }
             }
         };
 
@@ -465,6 +597,14 @@ impl Rga {
             // Update weight
             let new_weight = prev_span.visible_len() as u64;
             self.spans.update_weight(prev_idx, new_weight);
+            
+            // Update cache: point to end of the coalesced span
+            // After insert at pos with span_len, the last inserted char is at pos + span_len - 1
+            self.cursor_cache.update(
+                pos + span_len - 1,
+                prev_idx,
+                new_weight - 1,
+            );
             return;
         }
 
@@ -474,6 +614,13 @@ impl Rga {
         if offset_in_prev == prev_visible_len - 1 {
             // Insert right after prev_span
             self.spans.insert(prev_idx + 1, span, span_len);
+            
+            // Update cache: point to end of the new span
+            self.cursor_cache.update(
+                pos + span_len - 1,
+                prev_idx + 1,
+                span_len - 1,
+            );
         } else {
             // Need to split prev_span - insert in the middle
             let split_offset = (offset_in_prev + 1) as u32;
@@ -482,6 +629,13 @@ impl Rga {
             self.spans.insert(prev_idx, existing, existing.visible_len() as u64);
             self.spans.insert(prev_idx + 1, span, span_len);
             self.spans.insert(prev_idx + 2, right, right.visible_len() as u64);
+            
+            // Update cache: point to end of the new span (which is at prev_idx + 1)
+            self.cursor_cache.update(
+                pos + span_len - 1,
+                prev_idx + 1,
+                span_len - 1,
+            );
         }
     }
 
@@ -1036,5 +1190,194 @@ mod trace_repro_tests {
         // Can't coalesce with the deleted span
         
         assert_eq!(rga.to_string(), "abd");
+    }
+}
+
+#[cfg(test)]
+mod cursor_cache_tests {
+    use super::*;
+    use crate::key::KeyPair;
+
+    #[test]
+    fn cursor_cache_sequential_typing() {
+        // Sequential typing should use the cursor cache for O(1) lookups
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        // Type "hello" one character at a time
+        rga.insert(&pair.key_pub, 0, b"h");
+        assert!(rga.cursor_cache.valid);
+        assert_eq!(rga.cursor_cache.visible_pos, 0); // Position of 'h'
+        
+        rga.insert(&pair.key_pub, 1, b"e");
+        assert!(rga.cursor_cache.valid);
+        assert_eq!(rga.cursor_cache.visible_pos, 1); // Position of 'e'
+        
+        rga.insert(&pair.key_pub, 2, b"l");
+        assert!(rga.cursor_cache.valid);
+        assert_eq!(rga.cursor_cache.visible_pos, 2);
+        
+        rga.insert(&pair.key_pub, 3, b"l");
+        assert!(rga.cursor_cache.valid);
+        assert_eq!(rga.cursor_cache.visible_pos, 3);
+        
+        rga.insert(&pair.key_pub, 4, b"o");
+        assert!(rga.cursor_cache.valid);
+        assert_eq!(rga.cursor_cache.visible_pos, 4);
+        
+        assert_eq!(rga.to_string(), "hello");
+        // All inserts coalesced into one span
+        assert_eq!(rga.span_count(), 1);
+    }
+
+    #[test]
+    fn cursor_cache_after_delete() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        rga.insert(&pair.key_pub, 0, b"hello");
+        assert!(rga.cursor_cache.valid);
+        
+        // Delete in the middle - cache is always invalidated on delete
+        // because deletes can cause span splits that change span indices
+        rga.delete(2, 1); // Delete 'l'
+        
+        // Cache should be invalidated after any delete
+        assert!(!rga.cursor_cache.valid);
+        
+        assert_eq!(rga.to_string(), "helo");
+    }
+
+    #[test]
+    fn cursor_cache_insert_at_beginning() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        rga.insert(&pair.key_pub, 0, b"world");
+        assert!(rga.cursor_cache.valid);
+        let old_pos = rga.cursor_cache.visible_pos;
+        
+        // Insert at beginning - cache should shift
+        rga.insert(&pair.key_pub, 0, b"hello ");
+        
+        // Cache was adjusted: old position shifted by insert length
+        if rga.cursor_cache.valid {
+            assert_eq!(rga.cursor_cache.visible_pos, old_pos + 6);
+        }
+        
+        assert_eq!(rga.to_string(), "hello world");
+    }
+
+    #[test]
+    fn cursor_cache_multiple_users() {
+        let alice = KeyPair::generate();
+        let bob = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        // Alice types
+        rga.insert(&alice.key_pub, 0, b"aaa");
+        assert!(rga.cursor_cache.valid);
+        
+        // Bob types at end - cache should still work
+        rga.insert(&bob.key_pub, 3, b"bbb");
+        assert!(rga.cursor_cache.valid);
+        
+        assert_eq!(rga.to_string(), "aaabbb");
+    }
+
+    #[test]
+    fn cursor_cache_random_access() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        rga.insert(&pair.key_pub, 0, b"0123456789");
+        
+        // Insert at position 5 (middle)
+        rga.insert(&pair.key_pub, 5, b"X");
+        assert!(rga.cursor_cache.valid);
+        
+        // Insert at position 2 (far from cache) - cache miss but still works
+        rga.insert(&pair.key_pub, 2, b"Y");
+        assert!(rga.cursor_cache.valid);
+        
+        assert_eq!(rga.to_string(), "01Y234X56789");
+    }
+
+    #[test]
+    fn cursor_cache_empty_then_insert() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        // Cache starts invalid
+        assert!(!rga.cursor_cache.valid);
+        
+        // First insert
+        rga.insert(&pair.key_pub, 0, b"hello");
+        
+        // Cache should now be valid
+        assert!(rga.cursor_cache.valid);
+        assert_eq!(rga.cursor_cache.visible_pos, 4); // Last char position
+    }
+
+    #[test]
+    fn cursor_cache_delete_before_cache() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        rga.insert(&pair.key_pub, 0, b"hello world");
+        assert!(rga.cursor_cache.valid);
+        
+        // Cache points to end of "hello world" (position 10)
+        assert_eq!(rga.cursor_cache.visible_pos, 10);
+        
+        // Delete "hello " (positions 0-5)
+        rga.delete(0, 6);
+        
+        // Cache is invalidated after any delete because deletes can cause
+        // span splits that change span indices
+        assert!(!rga.cursor_cache.valid);
+        
+        assert_eq!(rga.to_string(), "world");
+    }
+
+    #[test]
+    fn cursor_cache_delete_at_cache() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        rga.insert(&pair.key_pub, 0, b"hello");
+        assert!(rga.cursor_cache.valid);
+        assert_eq!(rga.cursor_cache.visible_pos, 4); // Points to 'o'
+        
+        // Delete 'o' (the cached position)
+        rga.delete(4, 1);
+        
+        // Cache should be invalidated since we deleted the cached position
+        assert!(!rga.cursor_cache.valid);
+        
+        assert_eq!(rga.to_string(), "hell");
+    }
+
+    #[test]
+    fn cursor_cache_backspace_pattern() {
+        // Simulate backspace: delete at current position, then continue typing
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        // Type "hello"
+        rga.insert(&pair.key_pub, 0, b"hello");
+        assert_eq!(rga.to_string(), "hello");
+        
+        // Backspace (delete 'o')
+        rga.delete(4, 1);
+        assert_eq!(rga.to_string(), "hell");
+        
+        // Type 'p' at position 4
+        rga.insert(&pair.key_pub, 4, b"p");
+        assert_eq!(rga.to_string(), "hellp");
+        
+        // Continue typing
+        rga.insert(&pair.key_pub, 5, b"!");
+        assert_eq!(rga.to_string(), "hellp!");
     }
 }

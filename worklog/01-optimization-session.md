@@ -55,15 +55,47 @@ Commit: 674d624 "Compact span structure: 2.8ms -> 2.1ms (1.34x speedup)"
 
 ### Optimization 2: Fenwick Tree for Chunk Weights
 
+Status: COMPLETE (mixed results)
+
+Changes:
+- Added FenwickTree data structure for O(log n) prefix sum queries
+- Hybrid approach: use linear scan for < 64 chunks, Fenwick for >= 64
+- Significant improvement on large traces, slight regression on small traces
+
+Results after optimization 2:
+
+| Trace | Together | Diamond-types | Ratio | Change |
+|-------|----------|---------------|-------|--------|
+| sveltecomponent | 2.42ms | 1.28ms | 1.9x slower | was 1.75x (regression) |
+| rustcode | 5.61ms | 3.02ms | 1.9x slower | same |
+| seph-blog1 | 16.1ms | 6.59ms | 2.4x slower | was 3.76x (improvement!) |
+
+Trade-off: Fenwick tree adds overhead to small traces but dramatically improves large traces.
+Decision: Keep it because seph-blog1 improvement (3.76x -> 2.4x) is more important.
+
+Commits: fc0d3e3, b51bb51
+
+### Optimization 3: Cursor Caching
+
 Status: Starting...
 
 ---
 
 ## Summary
 
-| Optimization | Speedup | Status |
-|-------------|---------|--------|
-| 1. Compact Span | 1.34x | Complete |
-| 2. Fenwick Tree | - | In Progress |
-| 3. Cursor Caching | - | Pending |
+| Optimization | Effect | Status |
+|-------------|--------|--------|
+| 1. Compact Span | 1.34x faster | Complete |
+| 2. Fenwick Tree | Helps large traces | Complete |
+| 3. Cursor Caching | - | In Progress |
 | 4. B-Tree/Skip List | - | Pending |
+
+## Current State
+
+| Trace | Together | Diamond-types | Ratio |
+|-------|----------|---------------|-------|
+| sveltecomponent | 2.42ms | 1.28ms | 1.9x slower |
+| rustcode | 5.61ms | 3.02ms | 1.9x slower |
+| seph-blog1 | 16.1ms | 6.59ms | 2.4x slower |
+
+Need: ~2x improvement to beat diamond-types on 3/4 benchmarks.
