@@ -10,6 +10,7 @@ pub mod rga;
 // pub mod rope; // TODO: Fix rope skip list bugs
 pub mod skip_list;
 pub mod weighted_list;
+pub mod weighted_skip_list;
 
 /// A CRDT is a data type with a merge operator that is commutative,
 /// associative, and idempotent.
