@@ -83,6 +83,59 @@ impl std::fmt::Debug for ItemId {
     }
 }
 
+// =============================================================================
+// Public types for document API
+// =============================================================================
+
+/// Whether an anchor stays before or after its target character
+/// when text is inserted exactly at the anchor position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorBias {
+    /// Anchor stays before the character (insertion at anchor pushes anchor right).
+    Before,
+    /// Anchor stays after the character (insertion at anchor keeps anchor in place).
+    After,
+}
+
+/// A position in the document that tracks a specific character.
+///
+/// Anchors move with edits: if text is inserted before the anchor,
+/// the anchor's resolved position increases. If the anchored character
+/// is deleted, the anchor resolves to None.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// User index of the anchored character.
+    user_idx: u16,
+    /// Sequence number of the anchored character.
+    seq: u32,
+    /// Bias for insertion at anchor position.
+    bias: AnchorBias,
+}
+
+/// A range defined by two anchors.
+///
+/// The start anchor has After bias (range expands when inserting at start).
+/// The end anchor has Before bias (range expands when inserting at end).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnchorRange {
+    /// Start anchor (After bias - stays after its character).
+    pub start: Anchor,
+    /// End anchor (Before bias - stays before its character).
+    pub end: Anchor,
+}
+
+/// A version identifier for accessing historical document states.
+///
+/// The implementation varies depending on the versioning strategy:
+/// - Logical: Lamport timestamp
+/// - Persistent: B-tree root reference
+/// - Checkpoint: Checkpoint index + operation offset
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Version {
+    /// Lamport timestamp at this version.
+    lamport: u64,
+}
+
 /// A compact reference to an origin position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OriginRef {
@@ -300,6 +353,8 @@ pub struct Rga {
     users: UserTable,
     /// Cursor cache for amortizing sequential lookups.
     cursor_cache: CursorCache,
+    /// Lamport timestamp for versioning.
+    lamport: u64,
 }
 
 impl Rga {
@@ -310,6 +365,7 @@ impl Rga {
             columns: Vec::new(),
             users: UserTable::new(),
             cursor_cache: CursorCache::new(),
+            lamport: 0,
         };
     }
 
@@ -351,6 +407,9 @@ impl Rga {
     /// Does not return ItemId to avoid the overhead of looking up the user key.
     #[inline]
     fn insert_with_user_idx(&mut self, user_idx: u16, pos: u64, content: &[u8]) {
+        // Increment lamport clock
+        self.lamport += 1;
+
         let column = &mut self.columns[user_idx as usize];
         let seq = column.next_seq;
         let content_offset = column.content.len() as u32;
@@ -383,6 +442,9 @@ impl Rga {
                 visible_len
             );
         }
+
+        // Increment lamport clock
+        self.lamport += 1;
 
         // Adjust or invalidate the cursor cache
         // Delete operations can create/remove spans, so we invalidate if the delete
@@ -449,6 +511,215 @@ impl Rga {
             }
         }
         return String::from_utf8(result).unwrap_or_default();
+    }
+
+    /// Read characters in the range [start, end) without allocating the full document.
+    ///
+    /// Returns None if the range is out of bounds.
+    ///
+    /// # Example
+    /// ```
+    /// use together::crdt::rga::Rga;
+    /// use together::key::KeyPair;
+    ///
+    /// let user = KeyPair::generate();
+    /// let mut rga = Rga::new();
+    /// rga.insert(&user.key_pub, 0, b"hello world");
+    ///
+    /// assert_eq!(rga.slice(0, 5), Some("hello".to_string()));
+    /// assert_eq!(rga.slice(6, 11), Some("world".to_string()));
+    /// ```
+    pub fn slice(&self, start: u64, end: u64) -> Option<String> {
+        if start > end {
+            return None;
+        }
+        if end > self.len() {
+            return None;
+        }
+        if start == end {
+            return Some(String::new());
+        }
+
+        let mut result = Vec::with_capacity((end - start) as usize);
+        let mut pos: u64 = 0;
+
+        for span in self.spans.iter() {
+            if span.deleted {
+                continue;
+            }
+
+            let span_len = span.len as u64;
+            let span_end = pos + span_len;
+
+            // Skip spans entirely before our range
+            if span_end <= start {
+                pos = span_end;
+                continue;
+            }
+
+            // Stop if we've passed the end
+            if pos >= end {
+                break;
+            }
+
+            // Calculate overlap
+            let overlap_start = start.max(pos);
+            let overlap_end = end.min(span_end);
+            let offset_in_span = (overlap_start - pos) as usize;
+            let len_to_copy = (overlap_end - overlap_start) as usize;
+
+            let column = &self.columns[span.user_idx as usize];
+            let content_start = span.content_offset as usize + offset_in_span;
+            let content_end = content_start + len_to_copy;
+            result.extend_from_slice(&column.content[content_start..content_end]);
+
+            pos = span_end;
+        }
+
+        return Some(String::from_utf8(result).unwrap_or_default());
+    }
+
+    /// Create an anchor at the given visible position.
+    ///
+    /// Returns None if position is out of bounds.
+    pub fn anchor_at(&self, pos: u64, bias: AnchorBias) -> Option<Anchor> {
+        if pos >= self.len() {
+            return None;
+        }
+
+        // Find the span containing this position
+        let (span_idx, offset_in_span) = self.spans.find_by_weight(pos)?;
+        let span = self.spans.get(span_idx)?;
+
+        // The anchor refers to the character at pos
+        let seq = span.seq + offset_in_span as u32;
+
+        return Some(Anchor {
+            user_idx: span.user_idx,
+            seq,
+            bias,
+        });
+    }
+
+    /// Resolve an anchor to its current visible position.
+    ///
+    /// Returns None if the anchored character has been deleted.
+    pub fn resolve_anchor(&self, anchor: &Anchor) -> Option<u64> {
+        // Find the span containing this anchor's character
+        let mut pos: u64 = 0;
+
+        for span in self.spans.iter() {
+            if span.user_idx == anchor.user_idx && span.contains_seq(anchor.seq) {
+                // Found the span containing our character
+                if span.deleted {
+                    return None;
+                }
+                let offset = anchor.seq - span.seq;
+                return Some(pos + offset as u64);
+            }
+
+            if !span.deleted {
+                pos += span.len as u64;
+            }
+        }
+
+        return None;
+    }
+
+    /// Create an anchor range for [start, end).
+    ///
+    /// The start anchor has After bias (expands when inserting at start).
+    /// The end anchor has Before bias (expands when inserting at end).
+    ///
+    /// Returns None if either position is out of bounds.
+    pub fn anchor_range(&self, start: u64, end: u64) -> Option<AnchorRange> {
+        if start > end || end > self.len() {
+            return None;
+        }
+
+        // Handle empty range at end of document
+        if start == end {
+            if start == 0 {
+                return None; // Can't create empty range at start of empty doc
+            }
+            // Create anchors at the same position
+            let anchor = self.anchor_at(start.saturating_sub(1), AnchorBias::After)?;
+            return Some(AnchorRange {
+                start: anchor.clone(),
+                end: anchor,
+            });
+        }
+
+        // Start anchor: points to first char of range with After bias
+        // This means if we insert AT start position, the inserted text
+        // appears BEFORE the anchored char, so the range expands to include it
+        let start_anchor = self.anchor_at(start, AnchorBias::After)?;
+
+        // End anchor: points to last char IN the range (position end-1) with Before bias
+        // This means if we insert AT end position, the inserted text
+        // appears AFTER the anchored char, so the range expands to include it
+        let end_anchor = self.anchor_at(end - 1, AnchorBias::Before)?;
+
+        return Some(AnchorRange {
+            start: start_anchor,
+            end: end_anchor,
+        });
+    }
+
+    /// Get the current slice for an anchor range.
+    ///
+    /// Returns None if either anchor's character has been deleted.
+    pub fn slice_anchored(&self, range: &AnchorRange) -> Option<String> {
+        let start = self.resolve_anchor(&range.start)?;
+        let end_char_pos = self.resolve_anchor(&range.end)?;
+
+        // The end anchor points to the last character IN the range
+        // So the slice end is end_char_pos + 1
+        let end = end_char_pos + 1;
+
+        if start > end {
+            return Some(String::new());
+        }
+
+        return self.slice(start, end);
+    }
+
+    /// Get the current version.
+    ///
+    /// The version can be used with `to_string_at`, `slice_at`, and `len_at`
+    /// to access historical document states.
+    pub fn version(&self) -> Version {
+        return Version {
+            lamport: self.lamport,
+        };
+    }
+
+    /// Get the full document at a specific version.
+    ///
+    /// Note: The current implementation on main branch only supports
+    /// the current version. Full versioning is implemented on feature branches.
+    pub fn to_string_at(&self, _version: &Version) -> String {
+        // TODO: Implement versioning on feature branches
+        // For now, just return current state
+        return self.to_string();
+    }
+
+    /// Read a slice at a specific version.
+    ///
+    /// Note: The current implementation on main branch only supports
+    /// the current version. Full versioning is implemented on feature branches.
+    pub fn slice_at(&self, start: u64, end: u64, _version: &Version) -> Option<String> {
+        // TODO: Implement versioning on feature branches
+        return self.slice(start, end);
+    }
+
+    /// Get the document length at a specific version.
+    ///
+    /// Note: The current implementation on main branch only supports
+    /// the current version. Full versioning is implemented on feature branches.
+    pub fn len_at(&self, _version: &Version) -> u64 {
+        // TODO: Implement versioning on feature branches
+        return self.len();
     }
 
     /// Insert a span at the given visible position (for local edits).
