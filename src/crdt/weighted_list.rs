@@ -1,314 +1,235 @@
 // model = "claude-opus-4-5"
 // created = "2026-01-30"
-// modified = "2026-01-30"
+// modified = "2026-01-31"
 // driver = "Isaac Clayton"
 
-//! Weighted Skip List
+//! Chunked Weighted List
 //!
-//! A skip list where each item has an associated weight. Position lookups
-//! use cumulative weights rather than item indices. This is designed for
-//! RGA integration where spans have variable visible lengths.
+//! A weighted list organized into chunks for O(sqrt(n)) operations.
+//! Each chunk stores items with their weights. Chunks are sized around sqrt(n)
+//! and we maintain cumulative weights per chunk for O(sqrt(n)) lookups.
 //!
-//! Key differences from the unrolled SkipList:
-//! - One item per node (no chunking)
-//! - Weights are u64 (to handle large character counts)
-//! - Position lookup by cumulative weight
-//! - Support for updating weights (e.g., when marking spans as deleted)
+//! For n=20k items with sqrt(n)=140 chunk size:
+//! - find_by_weight: O(sqrt(n)) to find chunk + O(sqrt(n)) within chunk
+//! - insert: O(sqrt(n)) to find chunk + O(sqrt(n)) within chunk
+//! - remove: O(sqrt(n)) to find chunk + O(sqrt(n)) within chunk
 
-/// Maximum skip list height. 16 levels covers billions of items.
-const MAX_HEIGHT: usize = 16;
+const TARGET_CHUNK_SIZE: usize = 64;
+const MAX_CHUNK_SIZE: usize = 128;
 
-/// Node index type.
-type Idx = u32;
-
-/// Null index marker.
-const NULL: Idx = Idx::MAX;
-
-/// A node in the weighted skip list.
-struct Node<T> {
-    /// The item stored in this node.
-    item: Option<T>,
-    /// Height of this node's tower (for future O(log n) optimization).
-    #[allow(dead_code)]
-    height: u8,
-    /// Forward pointers at each level.
-    next: [Idx; MAX_HEIGHT],
-    /// Weight sums at each level (for future O(log n) optimization).
-    /// widths[level] = total weight from this node to next[level] (exclusive).
-    #[allow(dead_code)]
-    widths: [u64; MAX_HEIGHT],
-    /// This item's weight.
-    weight: u64,
+/// A chunk of items with their weights.
+struct Chunk<T> {
+    items: Vec<(T, u64)>,
+    total_weight: u64,
 }
 
-impl<T> Node<T> {
-    fn new(item: T, weight: u64, height: u8) -> Self {
-        let mut node = Node {
-            item: Some(item),
-            height,
-            next: [NULL; MAX_HEIGHT],
-            widths: [0; MAX_HEIGHT],
-            weight,
-        };
-        // At level 0, width equals this item's weight
-        node.widths[0] = weight;
-        node
-    }
-
-    fn new_head() -> Self {
-        Node {
-            item: None,
-            height: MAX_HEIGHT as u8,
-            next: [NULL; MAX_HEIGHT],
-            widths: [0; MAX_HEIGHT],
-            weight: 0,
+impl<T> Chunk<T> {
+    fn new() -> Self {
+        Chunk {
+            items: Vec::with_capacity(TARGET_CHUNK_SIZE),
+            total_weight: 0,
         }
     }
 
-    #[allow(dead_code)]
-    fn height(&self) -> usize {
-        self.height as usize
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn should_split(&self) -> bool {
+        self.items.len() >= MAX_CHUNK_SIZE
+    }
+
+    fn insert(&mut self, index: usize, item: T, weight: u64) {
+        self.items.insert(index, (item, weight));
+        self.total_weight += weight;
+    }
+
+    fn remove(&mut self, index: usize) -> (T, u64) {
+        let (item, weight) = self.items.remove(index);
+        self.total_weight -= weight;
+        (item, weight)
+    }
+
+    fn split(&mut self) -> Chunk<T> {
+        let mid = self.items.len() / 2;
+        let right_items: Vec<_> = self.items.drain(mid..).collect();
+        let right_weight: u64 = right_items.iter().map(|(_, w)| *w).sum();
+        self.total_weight -= right_weight;
+        Chunk {
+            items: right_items,
+            total_weight: right_weight,
+        }
+    }
+
+    /// Find item by weight within this chunk.
+    fn find_by_weight(&self, pos: u64) -> Option<(usize, u64)> {
+        let mut cumulative = 0u64;
+        for (i, (_, weight)) in self.items.iter().enumerate() {
+            if cumulative + weight > pos {
+                return Some((i, pos - cumulative));
+            }
+            cumulative += weight;
+        }
+        None
+    }
+
+    fn get(&self, index: usize) -> Option<&T> {
+        self.items.get(index).map(|(item, _)| item)
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.items.get_mut(index).map(|(item, _)| item)
+    }
+
+    fn update_weight(&mut self, index: usize, new_weight: u64) -> u64 {
+        let old_weight = self.items[index].1;
+        self.items[index].1 = new_weight;
+        self.total_weight = self.total_weight - old_weight + new_weight;
+        old_weight
     }
 }
 
-/// A weighted skip list with O(log n) operations.
+/// A weighted list organized into chunks.
 pub struct WeightedList<T> {
-    /// Arena of nodes.
-    nodes: Vec<Node<T>>,
-    /// Head node (sentinel).
-    head: Idx,
-    /// Total weight of all items.
+    chunks: Vec<Chunk<T>>,
     total_weight: u64,
-    /// Number of items.
     len: usize,
-    /// Free list for node reuse.
-    free_list: Vec<Idx>,
-    /// Random state for height generation.
-    rand_state: u64,
 }
 
 impl<T> WeightedList<T> {
-    /// Create a new empty weighted list.
     pub fn new() -> Self {
-        let mut list = WeightedList {
-            nodes: Vec::new(),
-            head: 0,
+        WeightedList {
+            chunks: vec![Chunk::new()],
             total_weight: 0,
             len: 0,
-            free_list: Vec::new(),
-            rand_state: 0x12345678_9abcdef0,
-        };
-        // Allocate head node
-        list.nodes.push(Node::new_head());
-        list
+        }
     }
 
-    /// Get the total weight of all items.
     pub fn total_weight(&self) -> u64 {
         self.total_weight
     }
 
-    /// Get the number of items.
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Check if empty.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    // --- Node access ---
-
-    fn node(&self, idx: Idx) -> &Node<T> {
-        &self.nodes[idx as usize]
-    }
-
-    fn node_mut(&mut self, idx: Idx) -> &mut Node<T> {
-        &mut self.nodes[idx as usize]
-    }
-
-    fn alloc_node(&mut self, item: T, weight: u64, height: u8) -> Idx {
-        if let Some(idx) = self.free_list.pop() {
-            self.nodes[idx as usize] = Node::new(item, weight, height);
-            idx
-        } else {
-            let idx = self.nodes.len() as Idx;
-            self.nodes.push(Node::new(item, weight, height));
-            idx
+    /// Find the chunk containing the given weight position.
+    /// Returns (chunk_index, weight_offset_in_chunk, items_before_chunk).
+    fn find_chunk_by_weight(&self, pos: u64) -> Option<(usize, u64, usize)> {
+        let mut cumulative_weight = 0u64;
+        let mut cumulative_items = 0usize;
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            if cumulative_weight + chunk.total_weight > pos {
+                return Some((i, pos - cumulative_weight, cumulative_items));
+            }
+            cumulative_weight += chunk.total_weight;
+            cumulative_items += chunk.len();
         }
+        None
     }
 
-    fn random_height(&mut self) -> u8 {
-        // xorshift64
-        let mut x = self.rand_state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rand_state = x;
-
-        // Geometric distribution via trailing zeros
-        let zeros = x.trailing_zeros() as u8;
-        (zeros.min(MAX_HEIGHT as u8 - 1)) + 1
+    /// Find the chunk containing the given index.
+    /// Returns (chunk_index, index_within_chunk).
+    fn find_chunk_by_index(&self, index: usize) -> (usize, usize) {
+        let mut cumulative = 0usize;
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            if cumulative + chunk.len() > index {
+                return (i, index - cumulative);
+            }
+            cumulative += chunk.len();
+        }
+        // Insert at end
+        let last = self.chunks.len().saturating_sub(1);
+        (last, self.chunks.get(last).map_or(0, |c| c.len()))
     }
 
     /// Find the item containing the given weight position.
     /// Returns (item_index, offset_within_item) or None if pos >= total_weight.
-    ///
-    /// Weight position semantics:
-    /// - Position 0 is the start of the first item
-    /// - Position W-1 is the last unit of an item with weight W
-    /// - Position W is the start of the next item
-    pub fn find_by_weight(&self, pos: u64) -> Option<(usize, u64)> {
+    pub fn find_by_weight(&mut self, pos: u64) -> Option<(usize, u64)> {
         if pos >= self.total_weight {
             return None;
         }
 
-        // Simple O(n) implementation for now - walk level 0
-        // TODO: Use higher levels for O(log n) lookup
-        let mut idx = self.node(self.head).next[0];
-        let mut cumulative = 0u64;
-        let mut item_index = 0usize;
+        let (chunk_idx, offset_in_chunk, items_before) = self.find_chunk_by_weight(pos)?;
+        let chunk = &self.chunks[chunk_idx];
+        let (idx_in_chunk, offset_in_item) = chunk.find_by_weight(offset_in_chunk)?;
 
-        while idx != NULL {
-            let weight = self.node(idx).weight;
-            if cumulative + weight > pos {
-                // Found the item containing pos
-                return Some((item_index, pos - cumulative));
-            }
-            cumulative += weight;
-            item_index += 1;
-            idx = self.node(idx).next[0];
-        }
-
-        // Should not reach here if pos < total_weight
-        None
+        Some((items_before + idx_in_chunk, offset_in_item))
     }
 
     /// Insert an item at the given index with the given weight.
     pub fn insert(&mut self, index: usize, item: T, weight: u64) {
-        assert!(index <= self.len, "index out of bounds");
-
-        let height = self.random_height();
-        let new_idx = self.alloc_node(item, weight, height);
-
-        // Simple O(n) implementation: walk level 0 to find insertion point
-        // TODO: Use higher levels for O(log n) insertion
-        
-        // Find predecessor at level 0
-        let mut pred_idx = self.head;
-        for _ in 0..index {
-            let next = self.node(pred_idx).next[0];
-            if next == NULL {
-                break;
-            }
-            pred_idx = next;
+        if self.chunks.is_empty() {
+            self.chunks.push(Chunk::new());
         }
 
-        // Wire up at level 0
-        let old_next = self.node(pred_idx).next[0];
-        self.node_mut(new_idx).next[0] = old_next;
-        self.node_mut(pred_idx).next[0] = new_idx;
-
-        // For now, only use level 0 (degrades to linked list)
-        // Higher level optimization can be added later
-
+        let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
+        self.chunks[chunk_idx].insert(idx_in_chunk, item, weight);
         self.total_weight += weight;
         self.len += 1;
+
+        // Split chunk if too large
+        if self.chunks[chunk_idx].should_split() {
+            let new_chunk = self.chunks[chunk_idx].split();
+            self.chunks.insert(chunk_idx + 1, new_chunk);
+        }
     }
 
-    /// Get the item at the given index.
     pub fn get(&self, index: usize) -> Option<&T> {
         if index >= self.len {
             return None;
         }
-        
-        let mut idx = self.node(self.head).next[0];
-        for _ in 0..index {
-            if idx == NULL {
-                return None;
-            }
-            idx = self.node(idx).next[0];
-        }
-        
-        self.node(idx).item.as_ref()
+        let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
+        self.chunks[chunk_idx].get(idx_in_chunk)
     }
 
-    /// Get a mutable reference to the item at the given index.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index >= self.len {
             return None;
         }
-        
-        let mut idx = self.node(self.head).next[0];
-        for _ in 0..index {
-            if idx == NULL {
-                return None;
-            }
-            idx = self.node(idx).next[0];
-        }
-        
-        self.node_mut(idx).item.as_mut()
+        let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
+        self.chunks[chunk_idx].get_mut(idx_in_chunk)
     }
 
     /// Update the weight of an item at the given index.
-    /// Returns the old weight.
     pub fn update_weight(&mut self, index: usize, new_weight: u64) -> u64 {
-        assert!(index < self.len, "index out of bounds");
-
-        // Find the node at the given index
-        let mut idx = self.node(self.head).next[0];
-        for _ in 0..index {
-            idx = self.node(idx).next[0];
-        }
-
-        let old_weight = self.node(idx).weight;
-        let delta = new_weight as i64 - old_weight as i64;
-
-        // Update the node's weight
-        self.node_mut(idx).weight = new_weight;
-
-        // Update total weight
-        self.total_weight = (self.total_weight as i64 + delta) as u64;
-        
+        let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
+        let old_weight = self.chunks[chunk_idx].update_weight(idx_in_chunk, new_weight);
+        self.total_weight = self.total_weight - old_weight + new_weight;
         old_weight
     }
 
-    /// Iterate over all items.
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        WeightedListIter {
-            list: self,
-            idx: self.node(self.head).next[0],
+    /// Remove an item at the given index.
+    pub fn remove(&mut self, index: usize) -> T {
+        let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
+        let (item, weight) = self.chunks[chunk_idx].remove(idx_in_chunk);
+        self.total_weight -= weight;
+        self.len -= 1;
+
+        // Remove empty chunks (but keep at least one)
+        if self.chunks[chunk_idx].is_empty() && self.chunks.len() > 1 {
+            self.chunks.remove(chunk_idx);
         }
+
+        item
     }
 
-    /// Iterate over all items with their indices.
-    pub fn iter_enumerate(&self) -> impl Iterator<Item = (usize, &T)> {
-        self.iter().enumerate()
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.chunks.iter().flat_map(|c| c.items.iter().map(|(item, _)| item))
     }
 }
 
 impl<T> Default for WeightedList<T> {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-struct WeightedListIter<'a, T> {
-    list: &'a WeightedList<T>,
-    idx: Idx,
-}
-
-impl<'a, T> Iterator for WeightedListIter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.idx == NULL {
-            return None;
-        }
-        let node = self.list.node(self.idx);
-        self.idx = node.next[0];
-        node.item.as_ref()
     }
 }
 
@@ -328,7 +249,7 @@ mod tests {
     fn insert_single() {
         let mut list = WeightedList::new();
         list.insert(0, "hello", 5);
-        
+
         assert_eq!(list.len(), 1);
         assert_eq!(list.total_weight(), 5);
         assert_eq!(list.get(0), Some(&"hello"));
@@ -340,9 +261,21 @@ mod tests {
         list.insert(0, "a", 3);
         list.insert(1, "b", 5);
         list.insert(2, "c", 2);
-        
+
         assert_eq!(list.len(), 3);
         assert_eq!(list.total_weight(), 10);
+        assert_eq!(list.get(0), Some(&"a"));
+        assert_eq!(list.get(1), Some(&"b"));
+        assert_eq!(list.get(2), Some(&"c"));
+    }
+
+    #[test]
+    fn insert_in_middle() {
+        let mut list = WeightedList::new();
+        list.insert(0, "a", 5);
+        list.insert(1, "c", 5);
+        list.insert(1, "b", 5);
+
         assert_eq!(list.get(0), Some(&"a"));
         assert_eq!(list.get(1), Some(&"b"));
         assert_eq!(list.get(2), Some(&"c"));
@@ -352,36 +285,26 @@ mod tests {
     fn find_by_weight_single() {
         let mut list = WeightedList::new();
         list.insert(0, "hello", 10);
-        
-        // Position 0-9 should all map to item 0
+
         assert_eq!(list.find_by_weight(0), Some((0, 0)));
         assert_eq!(list.find_by_weight(5), Some((0, 5)));
         assert_eq!(list.find_by_weight(9), Some((0, 9)));
-        
-        // Position 10 is past the end
         assert_eq!(list.find_by_weight(10), None);
     }
 
     #[test]
     fn find_by_weight_multiple() {
         let mut list = WeightedList::new();
-        list.insert(0, "a", 5);   // positions 0-4
-        list.insert(1, "b", 10);  // positions 5-14
-        list.insert(2, "c", 3);   // positions 15-17
-        
-        // First item
+        list.insert(0, "a", 5);
+        list.insert(1, "b", 10);
+        list.insert(2, "c", 3);
+
         assert_eq!(list.find_by_weight(0), Some((0, 0)));
         assert_eq!(list.find_by_weight(4), Some((0, 4)));
-        
-        // Second item
         assert_eq!(list.find_by_weight(5), Some((1, 0)));
         assert_eq!(list.find_by_weight(14), Some((1, 9)));
-        
-        // Third item
         assert_eq!(list.find_by_weight(15), Some((2, 0)));
         assert_eq!(list.find_by_weight(17), Some((2, 2)));
-        
-        // Past end
         assert_eq!(list.find_by_weight(18), None);
     }
 
@@ -389,14 +312,13 @@ mod tests {
     fn update_weight() {
         let mut list = WeightedList::new();
         list.insert(0, "a", 10);
-        
+
         assert_eq!(list.total_weight(), 10);
-        
+
         let old = list.update_weight(0, 5);
         assert_eq!(old, 10);
         assert_eq!(list.total_weight(), 5);
-        
-        // find_by_weight should reflect new weight
+
         assert_eq!(list.find_by_weight(4), Some((0, 4)));
         assert_eq!(list.find_by_weight(5), None);
     }
@@ -407,17 +329,29 @@ mod tests {
         list.insert(0, "a", 5);
         list.insert(1, "b", 10);
         list.insert(2, "c", 3);
-        
+
         assert_eq!(list.total_weight(), 18);
-        
-        // "Delete" middle item by setting weight to 0
+
         list.update_weight(1, 0);
         assert_eq!(list.total_weight(), 8);
-        
-        // find_by_weight should skip the zero-weight item
+
         assert_eq!(list.find_by_weight(4), Some((0, 4)));
-        // Position 5 should now be in item 2 (the third one)
         assert_eq!(list.find_by_weight(5), Some((2, 0)));
+    }
+
+    #[test]
+    fn remove_item() {
+        let mut list = WeightedList::new();
+        list.insert(0, "a", 5);
+        list.insert(1, "b", 10);
+        list.insert(2, "c", 3);
+
+        let removed = list.remove(1);
+        assert_eq!(removed, "b");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.total_weight(), 8);
+        assert_eq!(list.get(0), Some(&"a"));
+        assert_eq!(list.get(1), Some(&"c"));
     }
 
     #[test]
@@ -426,8 +360,73 @@ mod tests {
         list.insert(0, 1u32, 5);
         list.insert(1, 2u32, 10);
         list.insert(2, 3u32, 3);
-        
+
         let items: Vec<_> = list.iter().cloned().collect();
         assert_eq!(items, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn remove_and_reinsert() {
+        let mut list = WeightedList::new();
+        list.insert(0, "a", 5);
+        list.insert(1, "b", 10);
+
+        let b = list.remove(1);
+        assert_eq!(b, "b");
+        assert_eq!(list.total_weight(), 5);
+
+        list.insert(1, "c", 3);
+        assert_eq!(list.total_weight(), 8);
+        assert_eq!(list.get(1), Some(&"c"));
+
+        assert_eq!(list.find_by_weight(4), Some((0, 4)));
+        assert_eq!(list.find_by_weight(5), Some((1, 0)));
+        assert_eq!(list.find_by_weight(7), Some((1, 2)));
+        assert_eq!(list.find_by_weight(8), None);
+    }
+
+    #[test]
+    fn many_inserts() {
+        let mut list = WeightedList::new();
+        for i in 0..100 {
+            list.insert(i, i, i as u64 + 1);
+        }
+
+        assert_eq!(list.len(), 100);
+        // Total weight = 1 + 2 + ... + 100 = 100 * 101 / 2 = 5050
+        assert_eq!(list.total_weight(), 5050);
+
+        // Verify iteration
+        let items: Vec<_> = list.iter().cloned().collect();
+        assert_eq!(items, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn insert_at_beginning() {
+        let mut list = WeightedList::new();
+        for i in 0..10 {
+            list.insert(0, i, 1);
+        }
+
+        assert_eq!(list.len(), 10);
+        let items: Vec<_> = list.iter().cloned().collect();
+        // Inserting at 0 each time reverses the order
+        assert_eq!(items, (0..10).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn triggers_split() {
+        let mut list = WeightedList::new();
+        for i in 0..300 {
+            list.insert(i, i, 1);
+        }
+
+        assert_eq!(list.len(), 300);
+        assert!(list.chunks.len() > 1, "should have multiple chunks");
+
+        // Verify all items are accessible
+        for i in 0..300 {
+            assert_eq!(list.get(i), Some(&i));
+        }
     }
 }

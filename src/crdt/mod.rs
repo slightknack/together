@@ -7,6 +7,7 @@
 
 pub mod op;
 pub mod rga;
+// pub mod rope; // TODO: Fix rope skip list bugs
 pub mod skip_list;
 pub mod weighted_list;
 
