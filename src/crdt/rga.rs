@@ -275,10 +275,42 @@ impl Rga {
     }
 
     /// Insert a span at the given visible position (for local edits).
+    /// Attempts to coalesce with the preceding span if possible.
     fn insert_span_at_pos(&mut self, span: Span, pos: u64) {
         let span_len = span.visible_len();
 
-        if self.spans.is_empty() || pos == 0 {
+        if self.spans.is_empty() {
+            self.spans.insert(0, span, span_len);
+            return;
+        }
+
+        // Try to coalesce with the span ending at this position
+        if pos > 0 {
+            // Find the span containing the character just before our insert position
+            if let Some((prev_idx, offset_in_prev)) = self.spans.find_by_weight(pos - 1) {
+                let prev_span = self.spans.get(prev_idx).unwrap();
+                
+                // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted
+                // Also check offset_in_prev == prev_span.len - 1 to ensure we're at the end of the span
+                if prev_span.user == span.user
+                    && !prev_span.deleted
+                    && prev_span.seq + prev_span.len == span.seq
+                    && prev_span.content_offset + prev_span.len as usize == span.content_offset
+                    && offset_in_prev == prev_span.visible_len() - 1
+                {
+                    // Coalesce by extending the previous span
+                    let prev_span = self.spans.get_mut(prev_idx).unwrap();
+                    prev_span.len += span.len;
+                    // Update weight
+                    let new_weight = prev_span.visible_len();
+                    self.spans.update_weight(prev_idx, new_weight);
+                    return;
+                }
+            }
+        }
+
+        // Can't coalesce, insert as new span
+        if pos == 0 {
             self.spans.insert(0, span, span_len);
             return;
         }
@@ -797,5 +829,58 @@ mod trace_repro_tests {
         
         rga.insert(&pair.key_pub, 10, b"d");
         assert_eq!(rga.len(), 1410);
+    }
+
+    #[test]
+    fn span_coalescing_sequential_inserts() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        // Sequential inserts at end should coalesce into one span
+        rga.insert(&pair.key_pub, 0, b"a");
+        assert_eq!(rga.span_count(), 1);
+        
+        rga.insert(&pair.key_pub, 1, b"b");
+        assert_eq!(rga.span_count(), 1); // Should coalesce
+        
+        rga.insert(&pair.key_pub, 2, b"c");
+        assert_eq!(rga.span_count(), 1); // Should coalesce
+        
+        assert_eq!(rga.to_string(), "abc");
+        assert_eq!(rga.len(), 3);
+    }
+
+    #[test]
+    fn span_coalescing_non_sequential() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        // Insert at beginning
+        rga.insert(&pair.key_pub, 0, b"hello");
+        assert_eq!(rga.span_count(), 1);
+        
+        // Insert at beginning again - can't coalesce (different position)
+        rga.insert(&pair.key_pub, 0, b"X");
+        assert_eq!(rga.span_count(), 2);
+        
+        assert_eq!(rga.to_string(), "Xhello");
+    }
+
+    #[test]
+    fn span_coalescing_after_delete() {
+        let pair = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        // Insert, delete, insert - should not coalesce across delete
+        rga.insert(&pair.key_pub, 0, b"abc");
+        assert_eq!(rga.span_count(), 1);
+        
+        rga.delete(2, 1); // Delete 'c'
+        // Delete splits span, so we have 2 spans now (one for 'ab', one deleted for 'c')
+        
+        rga.insert(&pair.key_pub, 2, b"d");
+        // Can't coalesce with the deleted span
+        
+        assert_eq!(rga.to_string(), "abd");
     }
 }
