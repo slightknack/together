@@ -19,6 +19,11 @@
 const TARGET_CHUNK_SIZE: usize = 64;
 const MAX_CHUNK_SIZE: usize = 128;
 
+/// Threshold for switching from linear scan to Fenwick tree.
+/// For small chunk counts, O(n) linear scan with good constants beats O(log n) with overhead.
+/// sveltecomponent has ~59 chunks, seph-blog1 has ~168 chunks.
+const FENWICK_THRESHOLD: usize = 64;
+
 /// Fenwick Tree (Binary Indexed Tree) for O(log n) prefix sum queries and updates.
 ///
 /// The tree uses 1-based indexing internally. Each position i stores the sum of
@@ -197,13 +202,19 @@ impl<T> Chunk<T> {
     }
 }
 
-/// A weighted list organized into chunks with Fenwick trees for O(log n) lookups.
+/// A weighted list organized into chunks with optional Fenwick trees for O(log n) lookups.
+/// Uses linear scan for small chunk counts (< FENWICK_THRESHOLD) and Fenwick tree for larger counts.
 pub struct WeightedList<T> {
     chunks: Vec<Chunk<T>>,
     /// Fenwick tree tracking chunk weights for O(log n) weight prefix sum queries.
+    /// Only valid when `use_fenwick` is true.
     chunk_weights: FenwickTree,
     /// Fenwick tree tracking chunk item counts for O(log n) index prefix sum queries.
+    /// Only valid when `use_fenwick` is true.
     chunk_counts: FenwickTree,
+    /// Whether to use Fenwick trees for lookups.
+    /// False for small chunk counts where linear scan is faster.
+    use_fenwick: bool,
     total_weight: u64,
     len: usize,
 }
@@ -214,6 +225,7 @@ impl<T> WeightedList<T> {
             chunks: vec![Chunk::new()],
             chunk_weights: FenwickTree::new(1),
             chunk_counts: FenwickTree::new(1),
+            use_fenwick: false, // Start with linear scan, only 1 chunk
             total_weight: 0,
             len: 0,
         }
@@ -244,35 +256,49 @@ impl<T> WeightedList<T> {
 
     /// Find the chunk containing the given weight position.
     /// Returns (chunk_index, weight_offset_in_chunk, items_before_chunk).
-    /// Uses Fenwick trees for O(log n) chunk and item count lookup.
+    /// Uses linear scan for small chunk counts, Fenwick tree for larger counts.
     fn find_chunk_by_weight(&self, pos: u64) -> Option<(usize, u64, usize)> {
         if pos >= self.total_weight {
             return None;
         }
 
-        // Use Fenwick tree to find the chunk in O(log n)
-        let chunk_idx = self.chunk_weights.find_first_exceeding(pos);
+        if self.use_fenwick {
+            // Use Fenwick tree to find the chunk in O(log n)
+            let chunk_idx = self.chunk_weights.find_first_exceeding(pos);
 
-        // Compute the weight before this chunk using Fenwick tree in O(log n)
-        let weight_before = if chunk_idx == 0 {
-            0
+            // Compute the weight before this chunk using Fenwick tree in O(log n)
+            let weight_before = if chunk_idx == 0 {
+                0
+            } else {
+                self.chunk_weights.prefix_sum(chunk_idx - 1)
+            };
+
+            // Compute items before this chunk using Fenwick tree in O(log n)
+            let items_before = if chunk_idx == 0 {
+                0
+            } else {
+                self.chunk_counts.prefix_sum(chunk_idx - 1) as usize
+            };
+
+            return Some((chunk_idx, pos - weight_before, items_before));
         } else {
-            self.chunk_weights.prefix_sum(chunk_idx - 1)
-        };
-
-        // Compute items before this chunk using Fenwick tree in O(log n)
-        let items_before = if chunk_idx == 0 {
-            0
-        } else {
-            self.chunk_counts.prefix_sum(chunk_idx - 1) as usize
-        };
-
-        return Some((chunk_idx, pos - weight_before, items_before));
+            // Linear scan for small chunk counts - O(n) but with good constants
+            let mut weight_before = 0u64;
+            let mut items_before = 0usize;
+            for (idx, chunk) in self.chunks.iter().enumerate() {
+                if weight_before + chunk.total_weight > pos {
+                    return Some((idx, pos - weight_before, items_before));
+                }
+                weight_before += chunk.total_weight;
+                items_before += chunk.len();
+            }
+            return None;
+        }
     }
 
     /// Find the chunk containing the given index.
     /// Returns (chunk_index, index_within_chunk).
-    /// Uses Fenwick tree for O(log n) lookup.
+    /// Uses linear scan for small chunk counts, Fenwick tree for larger counts.
     fn find_chunk_by_index(&self, index: usize) -> (usize, usize) {
         if index >= self.len {
             // Insert at end
@@ -280,17 +306,31 @@ impl<T> WeightedList<T> {
             return (last, self.chunks.get(last).map_or(0, |c| c.len()));
         }
 
-        // Use Fenwick tree to find the chunk in O(log n)
-        let chunk_idx = self.chunk_counts.find_first_exceeding(index as u64);
+        if self.use_fenwick {
+            // Use Fenwick tree to find the chunk in O(log n)
+            let chunk_idx = self.chunk_counts.find_first_exceeding(index as u64);
 
-        // Compute items before this chunk using Fenwick tree in O(log n)
-        let items_before = if chunk_idx == 0 {
-            0
+            // Compute items before this chunk using Fenwick tree in O(log n)
+            let items_before = if chunk_idx == 0 {
+                0
+            } else {
+                self.chunk_counts.prefix_sum(chunk_idx - 1) as usize
+            };
+
+            return (chunk_idx, index - items_before);
         } else {
-            self.chunk_counts.prefix_sum(chunk_idx - 1) as usize
-        };
-
-        return (chunk_idx, index - items_before);
+            // Linear scan for small chunk counts - O(n) but with good constants
+            let mut items_before = 0usize;
+            for (idx, chunk) in self.chunks.iter().enumerate() {
+                if items_before + chunk.len() > index {
+                    return (idx, index - items_before);
+                }
+                items_before += chunk.len();
+            }
+            // Should not reach here if index < self.len
+            let last = self.chunks.len().saturating_sub(1);
+            return (last, self.chunks.get(last).map_or(0, |c| c.len()));
+        }
     }
 
     /// Find the item containing the given weight position.
@@ -311,7 +351,9 @@ impl<T> WeightedList<T> {
     pub fn insert(&mut self, index: usize, item: T, weight: u64) {
         if self.chunks.is_empty() {
             self.chunks.push(Chunk::new());
-            self.rebuild_fenwick();
+            if self.use_fenwick {
+                self.rebuild_fenwick();
+            }
         }
 
         let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
@@ -319,16 +361,25 @@ impl<T> WeightedList<T> {
         self.total_weight += weight;
         self.len += 1;
 
-        // Update Fenwick trees with the weight and count changes
-        self.chunk_weights.update(chunk_idx, weight as i64);
-        self.chunk_counts.update(chunk_idx, 1);
+        // Update Fenwick trees with the weight and count changes (only if using Fenwick)
+        if self.use_fenwick {
+            self.chunk_weights.update(chunk_idx, weight as i64);
+            self.chunk_counts.update(chunk_idx, 1);
+        }
 
         // Split chunk if too large
         if self.chunks[chunk_idx].should_split() {
             let new_chunk = self.chunks[chunk_idx].split();
             self.chunks.insert(chunk_idx + 1, new_chunk);
-            // Rebuild Fenwick trees after structural change
-            self.rebuild_fenwick();
+
+            // Check if we should switch to Fenwick mode
+            if !self.use_fenwick && self.chunks.len() >= FENWICK_THRESHOLD {
+                self.use_fenwick = true;
+                self.rebuild_fenwick();
+            } else if self.use_fenwick {
+                // Rebuild Fenwick trees after structural change
+                self.rebuild_fenwick();
+            }
         }
     }
 
@@ -354,9 +405,11 @@ impl<T> WeightedList<T> {
         let old_weight = self.chunks[chunk_idx].update_weight(idx_in_chunk, new_weight);
         self.total_weight = self.total_weight - old_weight + new_weight;
 
-        // Update Fenwick tree with the weight delta
-        let delta = new_weight as i64 - old_weight as i64;
-        self.chunk_weights.update(chunk_idx, delta);
+        // Update Fenwick tree with the weight delta (only if using Fenwick)
+        if self.use_fenwick {
+            let delta = new_weight as i64 - old_weight as i64;
+            self.chunk_weights.update(chunk_idx, delta);
+        }
 
         return old_weight;
     }
@@ -368,15 +421,24 @@ impl<T> WeightedList<T> {
         self.total_weight -= weight;
         self.len -= 1;
 
-        // Update Fenwick trees with negative weight and count
-        self.chunk_weights.update(chunk_idx, -(weight as i64));
-        self.chunk_counts.update(chunk_idx, -1);
+        // Update Fenwick trees with negative weight and count (only if using Fenwick)
+        if self.use_fenwick {
+            self.chunk_weights.update(chunk_idx, -(weight as i64));
+            self.chunk_counts.update(chunk_idx, -1);
+        }
 
         // Remove empty chunks (but keep at least one)
         if self.chunks[chunk_idx].is_empty() && self.chunks.len() > 1 {
             self.chunks.remove(chunk_idx);
-            // Rebuild Fenwick trees after structural change
-            self.rebuild_fenwick();
+
+            // Check if we should switch back to linear scan mode
+            if self.use_fenwick && self.chunks.len() < FENWICK_THRESHOLD {
+                self.use_fenwick = false;
+                // No need to rebuild Fenwick trees when switching to linear scan
+            } else if self.use_fenwick {
+                // Rebuild Fenwick trees after structural change
+                self.rebuild_fenwick();
+            }
         }
 
         return item;
