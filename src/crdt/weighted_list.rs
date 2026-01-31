@@ -3,19 +3,123 @@
 // modified = "2026-01-31"
 // driver = "Isaac Clayton"
 
-//! Chunked Weighted List
+//! Chunked Weighted List with Fenwick Tree
 //!
-//! A weighted list organized into chunks for O(sqrt(n)) operations.
-//! Each chunk stores items with their weights. Chunks are sized around sqrt(n)
-//! and we maintain cumulative weights per chunk for O(sqrt(n)) lookups.
+//! A weighted list organized into chunks with O(log n) weight lookup via Fenwick tree.
+//! Each chunk stores items with their weights. Chunks are sized around sqrt(n).
+//!
+//! The Fenwick tree (Binary Indexed Tree) maintains prefix sums of chunk weights,
+//! enabling O(log n) chunk lookup by weight position.
 //!
 //! For n=20k items with sqrt(n)=140 chunk size:
-//! - find_by_weight: O(sqrt(n)) to find chunk + O(sqrt(n)) within chunk
-//! - insert: O(sqrt(n)) to find chunk + O(sqrt(n)) within chunk
-//! - remove: O(sqrt(n)) to find chunk + O(sqrt(n)) within chunk
+//! - find_by_weight: O(log chunks) to find chunk + O(sqrt(n)) within chunk
+//! - insert: O(log chunks) for weight update + O(sqrt(n)) within chunk
+//! - remove: O(log chunks) for weight update + O(sqrt(n)) within chunk
 
 const TARGET_CHUNK_SIZE: usize = 64;
 const MAX_CHUNK_SIZE: usize = 128;
+
+/// Fenwick Tree (Binary Indexed Tree) for O(log n) prefix sum queries and updates.
+///
+/// The tree uses 1-based indexing internally. Each position i stores the sum of
+/// elements from (i - lowbit(i) + 1) to i, where lowbit(i) = i & -i.
+///
+/// This enables:
+/// - prefix_sum(i): O(log n) sum of elements 0..=i
+/// - update(i, delta): O(log n) add delta to element i
+/// - find_first_exceeding(target): O(log n) binary search for first index where prefix_sum > target
+#[derive(Clone, Debug)]
+struct FenwickTree {
+    /// 1-indexed tree array. tree[0] is unused.
+    tree: Vec<u64>,
+}
+
+impl FenwickTree {
+    /// Create a new Fenwick tree with capacity for n elements.
+    fn new(n: usize) -> FenwickTree {
+        return FenwickTree {
+            tree: vec![0; n + 1],
+        };
+    }
+
+    /// Compute prefix sum of elements 0..=i.
+    fn prefix_sum(&self, i: usize) -> u64 {
+        let mut idx = i + 1; // Convert to 1-indexed
+        let mut sum = 0u64;
+        while idx > 0 {
+            sum += self.tree[idx];
+            idx -= idx & idx.wrapping_neg(); // idx -= lowbit(idx)
+        }
+        return sum;
+    }
+
+    /// Add delta to element at index i.
+    fn update(&mut self, i: usize, delta: i64) {
+        let mut idx = i + 1; // Convert to 1-indexed
+        while idx < self.tree.len() {
+            self.tree[idx] = (self.tree[idx] as i64 + delta) as u64;
+            idx += idx & idx.wrapping_neg(); // idx += lowbit(idx)
+        }
+    }
+
+    /// Find the first index where prefix_sum(index) > target.
+    /// Returns the number of elements if no such index exists.
+    ///
+    /// This uses a more efficient O(log n) algorithm that descends the tree
+    /// directly rather than binary searching with prefix_sum calls.
+    fn find_first_exceeding(&self, target: u64) -> usize {
+        if self.tree.len() <= 1 {
+            return 0;
+        }
+
+        let n = self.tree.len() - 1;
+        let mut sum = 0u64;
+        let mut pos = 0usize;
+
+        // Find the largest power of 2 <= n
+        let mut bit = 1usize;
+        while bit * 2 <= n {
+            bit *= 2;
+        }
+
+        // Descend the tree
+        while bit > 0 {
+            let next = pos + bit;
+            if next <= n && sum + self.tree[next] <= target {
+                sum += self.tree[next];
+                pos = next;
+            }
+            bit /= 2;
+        }
+
+        // pos is now the largest index where prefix_sum(pos) <= target
+        // So pos + 1 is the first index where prefix_sum > target (in 1-indexed terms)
+        // Convert back to 0-indexed: the answer is pos (since prefix_sum(pos) in 0-indexed = sum up to pos)
+        return pos;
+    }
+
+    /// Build a Fenwick tree from an iterator of values.
+    fn from_iter<I: Iterator<Item = u64>>(iter: I) -> FenwickTree {
+        let values: Vec<u64> = iter.collect();
+        let n = values.len();
+        let mut tree = vec![0u64; n + 1];
+
+        // Copy values to 1-indexed positions
+        for (i, &v) in values.iter().enumerate() {
+            tree[i + 1] = v;
+        }
+
+        // Build tree in O(n) by propagating values upward
+        for i in 1..=n {
+            let parent = i + (i & i.wrapping_neg());
+            if parent <= n {
+                tree[parent] += tree[i];
+            }
+        }
+
+        return FenwickTree { tree };
+    }
+}
 
 /// A chunk of items with their weights.
 struct Chunk<T> {
@@ -93,9 +197,13 @@ impl<T> Chunk<T> {
     }
 }
 
-/// A weighted list organized into chunks.
+/// A weighted list organized into chunks with Fenwick trees for O(log n) lookups.
 pub struct WeightedList<T> {
     chunks: Vec<Chunk<T>>,
+    /// Fenwick tree tracking chunk weights for O(log n) weight prefix sum queries.
+    chunk_weights: FenwickTree,
+    /// Fenwick tree tracking chunk item counts for O(log n) index prefix sum queries.
+    chunk_counts: FenwickTree,
     total_weight: u64,
     len: usize,
 }
@@ -104,9 +212,22 @@ impl<T> WeightedList<T> {
     pub fn new() -> Self {
         WeightedList {
             chunks: vec![Chunk::new()],
+            chunk_weights: FenwickTree::new(1),
+            chunk_counts: FenwickTree::new(1),
             total_weight: 0,
             len: 0,
         }
+    }
+
+    /// Rebuild the Fenwick trees from current chunk state.
+    /// Called when chunks are added or removed.
+    fn rebuild_fenwick(&mut self) {
+        self.chunk_weights = FenwickTree::from_iter(
+            self.chunks.iter().map(|c| c.total_weight)
+        );
+        self.chunk_counts = FenwickTree::from_iter(
+            self.chunks.iter().map(|c| c.len() as u64)
+        );
     }
 
     pub fn total_weight(&self) -> u64 {
@@ -123,32 +244,53 @@ impl<T> WeightedList<T> {
 
     /// Find the chunk containing the given weight position.
     /// Returns (chunk_index, weight_offset_in_chunk, items_before_chunk).
+    /// Uses Fenwick trees for O(log n) chunk and item count lookup.
     fn find_chunk_by_weight(&self, pos: u64) -> Option<(usize, u64, usize)> {
-        let mut cumulative_weight = 0u64;
-        let mut cumulative_items = 0usize;
-        for (i, chunk) in self.chunks.iter().enumerate() {
-            if cumulative_weight + chunk.total_weight > pos {
-                return Some((i, pos - cumulative_weight, cumulative_items));
-            }
-            cumulative_weight += chunk.total_weight;
-            cumulative_items += chunk.len();
+        if pos >= self.total_weight {
+            return None;
         }
-        None
+
+        // Use Fenwick tree to find the chunk in O(log n)
+        let chunk_idx = self.chunk_weights.find_first_exceeding(pos);
+
+        // Compute the weight before this chunk using Fenwick tree in O(log n)
+        let weight_before = if chunk_idx == 0 {
+            0
+        } else {
+            self.chunk_weights.prefix_sum(chunk_idx - 1)
+        };
+
+        // Compute items before this chunk using Fenwick tree in O(log n)
+        let items_before = if chunk_idx == 0 {
+            0
+        } else {
+            self.chunk_counts.prefix_sum(chunk_idx - 1) as usize
+        };
+
+        return Some((chunk_idx, pos - weight_before, items_before));
     }
 
     /// Find the chunk containing the given index.
     /// Returns (chunk_index, index_within_chunk).
+    /// Uses Fenwick tree for O(log n) lookup.
     fn find_chunk_by_index(&self, index: usize) -> (usize, usize) {
-        let mut cumulative = 0usize;
-        for (i, chunk) in self.chunks.iter().enumerate() {
-            if cumulative + chunk.len() > index {
-                return (i, index - cumulative);
-            }
-            cumulative += chunk.len();
+        if index >= self.len {
+            // Insert at end
+            let last = self.chunks.len().saturating_sub(1);
+            return (last, self.chunks.get(last).map_or(0, |c| c.len()));
         }
-        // Insert at end
-        let last = self.chunks.len().saturating_sub(1);
-        (last, self.chunks.get(last).map_or(0, |c| c.len()))
+
+        // Use Fenwick tree to find the chunk in O(log n)
+        let chunk_idx = self.chunk_counts.find_first_exceeding(index as u64);
+
+        // Compute items before this chunk using Fenwick tree in O(log n)
+        let items_before = if chunk_idx == 0 {
+            0
+        } else {
+            self.chunk_counts.prefix_sum(chunk_idx - 1) as usize
+        };
+
+        return (chunk_idx, index - items_before);
     }
 
     /// Find the item containing the given weight position.
@@ -169,6 +311,7 @@ impl<T> WeightedList<T> {
     pub fn insert(&mut self, index: usize, item: T, weight: u64) {
         if self.chunks.is_empty() {
             self.chunks.push(Chunk::new());
+            self.rebuild_fenwick();
         }
 
         let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
@@ -176,10 +319,16 @@ impl<T> WeightedList<T> {
         self.total_weight += weight;
         self.len += 1;
 
+        // Update Fenwick trees with the weight and count changes
+        self.chunk_weights.update(chunk_idx, weight as i64);
+        self.chunk_counts.update(chunk_idx, 1);
+
         // Split chunk if too large
         if self.chunks[chunk_idx].should_split() {
             let new_chunk = self.chunks[chunk_idx].split();
             self.chunks.insert(chunk_idx + 1, new_chunk);
+            // Rebuild Fenwick trees after structural change
+            self.rebuild_fenwick();
         }
     }
 
@@ -204,7 +353,12 @@ impl<T> WeightedList<T> {
         let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
         let old_weight = self.chunks[chunk_idx].update_weight(idx_in_chunk, new_weight);
         self.total_weight = self.total_weight - old_weight + new_weight;
-        old_weight
+
+        // Update Fenwick tree with the weight delta
+        let delta = new_weight as i64 - old_weight as i64;
+        self.chunk_weights.update(chunk_idx, delta);
+
+        return old_weight;
     }
 
     /// Remove an item at the given index.
@@ -214,12 +368,18 @@ impl<T> WeightedList<T> {
         self.total_weight -= weight;
         self.len -= 1;
 
+        // Update Fenwick trees with negative weight and count
+        self.chunk_weights.update(chunk_idx, -(weight as i64));
+        self.chunk_counts.update(chunk_idx, -1);
+
         // Remove empty chunks (but keep at least one)
         if self.chunks[chunk_idx].is_empty() && self.chunks.len() > 1 {
             self.chunks.remove(chunk_idx);
+            // Rebuild Fenwick trees after structural change
+            self.rebuild_fenwick();
         }
 
-        item
+        return item;
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
@@ -236,6 +396,127 @@ impl<T> Default for WeightedList<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- FenwickTree tests ---
+
+    #[test]
+    fn fenwick_empty() {
+        let tree = FenwickTree::new(0);
+        assert_eq!(tree.tree.len(), 1); // Only the unused index 0
+    }
+
+    #[test]
+    fn fenwick_single_element() {
+        let mut tree = FenwickTree::new(1);
+        tree.update(0, 5);
+        assert_eq!(tree.prefix_sum(0), 5);
+        assert_eq!(tree.find_first_exceeding(4), 0);
+        assert_eq!(tree.find_first_exceeding(5), 1);
+    }
+
+    #[test]
+    fn fenwick_multiple_elements() {
+        let mut tree = FenwickTree::new(5);
+        // Set weights: [3, 5, 2, 7, 1]
+        tree.update(0, 3);
+        tree.update(1, 5);
+        tree.update(2, 2);
+        tree.update(3, 7);
+        tree.update(4, 1);
+
+        // Prefix sums: [3, 8, 10, 17, 18]
+        assert_eq!(tree.prefix_sum(0), 3);
+        assert_eq!(tree.prefix_sum(1), 8);
+        assert_eq!(tree.prefix_sum(2), 10);
+        assert_eq!(tree.prefix_sum(3), 17);
+        assert_eq!(tree.prefix_sum(4), 18);
+    }
+
+    #[test]
+    fn fenwick_find_first_exceeding() {
+        let mut tree = FenwickTree::new(5);
+        // Set weights: [3, 5, 2, 7, 1]
+        // Prefix sums: [3, 8, 10, 17, 18]
+        tree.update(0, 3);
+        tree.update(1, 5);
+        tree.update(2, 2);
+        tree.update(3, 7);
+        tree.update(4, 1);
+
+        // find_first_exceeding(target) returns first i where prefix_sum(i) > target
+        assert_eq!(tree.find_first_exceeding(0), 0);   // prefix_sum(0)=3 > 0
+        assert_eq!(tree.find_first_exceeding(2), 0);   // prefix_sum(0)=3 > 2
+        assert_eq!(tree.find_first_exceeding(3), 1);   // prefix_sum(1)=8 > 3
+        assert_eq!(tree.find_first_exceeding(7), 1);   // prefix_sum(1)=8 > 7
+        assert_eq!(tree.find_first_exceeding(8), 2);   // prefix_sum(2)=10 > 8
+        assert_eq!(tree.find_first_exceeding(9), 2);   // prefix_sum(2)=10 > 9
+        assert_eq!(tree.find_first_exceeding(10), 3);  // prefix_sum(3)=17 > 10
+        assert_eq!(tree.find_first_exceeding(16), 3);  // prefix_sum(3)=17 > 16
+        assert_eq!(tree.find_first_exceeding(17), 4);  // prefix_sum(4)=18 > 17
+        assert_eq!(tree.find_first_exceeding(18), 5);  // no index exceeds 18
+    }
+
+    #[test]
+    fn fenwick_update_negative() {
+        let mut tree = FenwickTree::new(3);
+        tree.update(0, 10);
+        tree.update(1, 5);
+        tree.update(2, 3);
+
+        assert_eq!(tree.prefix_sum(2), 18);
+
+        // Decrease middle element by 3
+        tree.update(1, -3);
+        assert_eq!(tree.prefix_sum(0), 10);
+        assert_eq!(tree.prefix_sum(1), 12);
+        assert_eq!(tree.prefix_sum(2), 15);
+    }
+
+    #[test]
+    fn fenwick_from_iter() {
+        let tree = FenwickTree::from_iter([3u64, 5, 2, 7, 1].into_iter());
+
+        // Prefix sums: [3, 8, 10, 17, 18]
+        assert_eq!(tree.prefix_sum(0), 3);
+        assert_eq!(tree.prefix_sum(1), 8);
+        assert_eq!(tree.prefix_sum(2), 10);
+        assert_eq!(tree.prefix_sum(3), 17);
+        assert_eq!(tree.prefix_sum(4), 18);
+    }
+
+    #[test]
+    fn fenwick_from_iter_large() {
+        // Test with 1000 elements
+        let values: Vec<u64> = (1..=1000).collect();
+        let tree = FenwickTree::from_iter(values.iter().copied());
+
+        // Sum of 1..=n is n*(n+1)/2
+        assert_eq!(tree.prefix_sum(0), 1);
+        assert_eq!(tree.prefix_sum(99), 5050);  // 100*101/2
+        assert_eq!(tree.prefix_sum(999), 500500);  // 1000*1001/2
+    }
+
+    #[test]
+    fn fenwick_find_with_zeros() {
+        // Test with some zero-weight elements
+        let tree = FenwickTree::from_iter([5u64, 0, 0, 3, 0, 2].into_iter());
+
+        // Prefix sums: [5, 5, 5, 8, 8, 10]
+        assert_eq!(tree.prefix_sum(0), 5);
+        assert_eq!(tree.prefix_sum(1), 5);
+        assert_eq!(tree.prefix_sum(2), 5);
+        assert_eq!(tree.prefix_sum(3), 8);
+        assert_eq!(tree.prefix_sum(4), 8);
+        assert_eq!(tree.prefix_sum(5), 10);
+
+        // Find should skip zero-weight elements correctly
+        assert_eq!(tree.find_first_exceeding(4), 0);  // prefix_sum(0)=5 > 4
+        assert_eq!(tree.find_first_exceeding(5), 3);  // prefix_sum(3)=8 > 5
+        assert_eq!(tree.find_first_exceeding(7), 3);  // prefix_sum(3)=8 > 7
+        assert_eq!(tree.find_first_exceeding(8), 5);  // prefix_sum(5)=10 > 8
+    }
+
+    // --- WeightedList tests ---
 
     #[test]
     fn empty_list() {

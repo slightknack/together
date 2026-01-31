@@ -1,6 +1,6 @@
 // model = "claude-opus-4-5"
 // created = "2026-01-30"
-// modified = "2026-01-30"
+// modified = "2026-01-31"
 // driver = "Isaac Clayton"
 
 //! Quick single-run benchmark for development iteration.
@@ -96,6 +96,8 @@ fn replay_diamond(data: &TestData) -> String {
 fn main() {
     let traces = [
         ("sveltecomponent", "data/editing-traces/sequential_traces/ascii_only/sveltecomponent.json.gz"),
+        ("rustcode", "data/editing-traces/sequential_traces/ascii_only/rustcode.json.gz"),
+        ("seph-blog1", "data/editing-traces/sequential_traces/ascii_only/seph-blog1.json.gz"),
     ];
 
     for (name, path) in &traces {
