@@ -1,7 +1,9 @@
 // model = "claude-opus-4-5"
 // created = "2026-01-30"
-// modified = "2026-01-30"
+// modified = "2026-01-31"
 // driver = "Isaac Clayton"
+
+//! Cryptographic key types and operations.
 
 use blake3::Hasher;
 use chacha20poly1305::XChaCha20Poly1305;

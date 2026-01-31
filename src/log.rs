@@ -1,6 +1,6 @@
 // model = "claude-opus-4-5"
 // created = "2026-01-30"
-// modified = "2026-01-30"
+// modified = "2026-01-31"
 // driver = "Isaac Clayton"
 
 //! Signed append-only logs with a 16-tree merkle structure.

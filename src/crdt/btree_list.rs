@@ -3,9 +3,7 @@
 // modified = "2026-01-31"
 // driver = "Isaac Clayton"
 
-//! B-tree Weighted List
-//!
-//! A weighted list implemented as a B-tree for O(log n) operations.
+//! B-tree based weighted list for O(log n) operations.
 //! Inspired by diamond-types' ContentTree.
 //!
 //! Structure:
@@ -619,34 +617,6 @@ impl<T: Clone> BTreeList<T> {
         return old_weight;
     }
 
-    /// Modify an item and update its weight in a single operation.
-    pub fn modify_and_update_weight<F>(&mut self, index: usize, f: F) -> Option<u64>
-    where
-        F: FnOnce(&mut T) -> u64,
-    {
-        if index >= self.len {
-            return None;
-        }
-        let (leaf_idx, idx_in_leaf) = self.find_leaf_by_index(index);
-        let leaf = &mut self.leaves[leaf_idx as usize];
-        let (item, old_weight) = &mut leaf.items[idx_in_leaf];
-        let old = *old_weight;
-        
-        let new_weight = f(item);
-        
-        *old_weight = new_weight;
-        leaf.total_weight = leaf.total_weight - old + new_weight;
-        self.total_weight = self.total_weight - old + new_weight;
-        
-        // Update ancestor weights
-        if self.height > 0 {
-            let delta = new_weight as i64 - old as i64;
-            self.update_ancestor_weights(leaf_idx, delta);
-        }
-        
-        return Some(new_weight);
-    }
-
     /// Modify an item and update its weight using cached leaf location.
     #[inline]
     pub fn modify_and_update_weight_with_hint<F>(
@@ -961,22 +931,6 @@ mod tests {
             let result = list.find_by_weight(i as u64);
             assert_eq!(result, Some((i, 0)));
         }
-    }
-
-    #[test]
-    fn modify_and_update_weight() {
-        let mut list = BTreeList::new();
-        list.insert(0, 10u32, 5);
-        list.insert(1, 20u32, 10);
-
-        let result = list.modify_and_update_weight(0, |item| {
-            *item += 5;
-            return 8;
-        });
-
-        assert_eq!(result, Some(8));
-        assert_eq!(list.get(0), Some(&15));
-        assert_eq!(list.total_weight(), 18);
     }
 
     #[test]

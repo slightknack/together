@@ -3,24 +3,24 @@
 // modified = "2026-01-31"
 // driver = "Isaac Clayton"
 
-//! Replicated Growable Array (RGA) implementation.
+//! Replicated Growable Array (RGA) - a sequence CRDT for collaborative text editing.
 //!
-//! This is a sequence CRDT optimized for text editing. Key design decisions:
+//! # Example
 //!
-//! 1. **Spans**: Consecutive insertions by the same user are stored as a single
-//!    span rather than individual items. This reduces memory ~14x in practice.
+//! ```
+//! use together::crdt::rga::RgaBuf;
+//! use together::key::KeyPair;
 //!
-//! 2. **Weighted list**: Spans are stored in a weighted list where each span's
-//!    weight is its visible character count. This enables position lookup by
-//!    character offset.
+//! let user = KeyPair::generate();
+//! let mut doc = RgaBuf::new();
 //!
-//! 3. **Append-only columns**: Each user has a column that only appends. This
-//!    makes replication trivial - just send new entries.
+//! doc.insert(&user.key_pub, 0, b"Hello");
+//! doc.insert(&user.key_pub, 5, b" World");
+//! assert_eq!(doc.to_string(), "Hello World");
 //!
-//! 4. **Compact representation**: Spans use 24 bytes instead of 112 bytes by:
-//!    - Storing user as a u16 index into a UserTable
-//!    - Storing origin as span_idx + offset (u32 + u32)
-//!    - Using u32 for seq/len/content_offset
+//! doc.delete(5, 6); // Delete " World"
+//! assert_eq!(doc.to_string(), "Hello");
+//! ```
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -34,7 +34,7 @@ const NO_ORIGIN: u32 = u32::MAX;
 /// A table mapping u16 indices to KeyPub values.
 /// This allows spans to store a 2-byte index instead of a 32-byte key.
 #[derive(Clone, Debug, Default)]
-pub struct UserTable {
+struct UserTable {
     /// Map from KeyPub to index.
     key_to_idx: FxHashMap<KeyPub, u16>,
     /// Map from index to KeyPub.
@@ -42,16 +42,14 @@ pub struct UserTable {
 }
 
 impl UserTable {
-    /// Create a new empty user table.
-    pub fn new() -> UserTable {
+    fn new() -> UserTable {
         return UserTable {
             key_to_idx: FxHashMap::default(),
             idx_to_key: Vec::new(),
         };
     }
 
-    /// Get or create an index for a user.
-    pub fn get_or_insert(&mut self, key: &KeyPub) -> u16 {
+    fn get_or_insert(&mut self, key: &KeyPub) -> u16 {
         if let Some(&idx) = self.key_to_idx.get(key) {
             return idx;
         }
@@ -62,33 +60,21 @@ impl UserTable {
         return idx;
     }
 
-    /// Get the index for a user, if it exists.
-    pub fn get(&self, key: &KeyPub) -> Option<u16> {
+    fn get(&self, key: &KeyPub) -> Option<u16> {
         return self.key_to_idx.get(key).copied();
     }
 
-    /// Get the KeyPub for an index.
-    pub fn get_key(&self, idx: u16) -> Option<&KeyPub> {
+    fn get_key(&self, idx: u16) -> Option<&KeyPub> {
         return self.idx_to_key.get(idx as usize);
     }
 
-    /// Number of users in the table.
-    pub fn len(&self) -> usize {
-        return self.idx_to_key.len();
-    }
-
-    /// Check if the table is empty.
-    pub fn is_empty(&self) -> bool {
-        return self.idx_to_key.is_empty();
-    }
 }
 
 /// A unique identifier for an item in the RGA.
-/// Composed of the user's public key and a sequence number.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ItemId {
-    pub user: KeyPub,
-    pub seq: u64,
+struct ItemId {
+    user: KeyPub,
+    seq: u64,
 }
 
 impl std::fmt::Debug for ItemId {
@@ -98,76 +84,41 @@ impl std::fmt::Debug for ItemId {
 }
 
 /// A compact reference to an origin position.
-/// Uses span index + offset within span instead of full ItemId.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OriginRef {
-    /// Index of the span containing the origin (u32::MAX = no origin).
-    pub span_idx: u32,
-    /// Offset within the span.
-    pub offset: u32,
+struct OriginRef {
+    span_idx: u32,
+    offset: u32,
 }
 
 impl OriginRef {
-    /// Create a reference meaning "no origin" (insert at beginning).
-    pub fn none() -> OriginRef {
+    fn none() -> OriginRef {
         return OriginRef {
             span_idx: NO_ORIGIN,
             offset: 0,
         };
     }
 
-    /// Create a reference to a specific span position.
-    pub fn some(span_idx: u32, offset: u32) -> OriginRef {
+    fn some(span_idx: u32, offset: u32) -> OriginRef {
         return OriginRef { span_idx, offset };
-    }
-
-    /// Check if this is a "no origin" reference.
-    pub fn is_none(&self) -> bool {
-        return self.span_idx == NO_ORIGIN;
-    }
-
-    /// Check if this is a valid origin reference.
-    pub fn is_some(&self) -> bool {
-        return self.span_idx != NO_ORIGIN;
     }
 }
 
-/// A compact span of consecutive items inserted by the same user.
-/// Target size: 24 bytes (down from 112 bytes).
-///
-/// Layout (ordered for optimal packing):
-/// - seq: u32 (4 bytes) - starting sequence number
-/// - len: u32 (4 bytes) - number of items
-/// - origin_span_idx: u32 (4 bytes) - origin span index (NO_ORIGIN = none)
-/// - origin_offset: u32 (4 bytes) - offset within origin span
-/// - content_offset: u32 (4 bytes) - offset into content backing store
-/// - user_idx: u16 (2 bytes) - index into UserTable
-/// - deleted: bool (1 byte) - whether this span is deleted
-/// - _padding: u8 (1 byte) - alignment padding
+/// A compact span of consecutive items inserted by the same user (24 bytes).
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct Span {
-    /// The starting sequence number.
-    pub seq: u32,
-    /// Number of items in this span.
-    pub len: u32,
-    /// Index of the origin span (NO_ORIGIN = no origin).
-    pub origin_span_idx: u32,
-    /// Offset within the origin span.
-    pub origin_offset: u32,
-    /// Offset into the content backing store.
-    pub content_offset: u32,
-    /// Index into the UserTable.
-    pub user_idx: u16,
-    /// Whether this span has been deleted.
-    pub deleted: bool,
-    /// Padding for alignment.
+struct Span {
+    seq: u32,
+    len: u32,
+    origin_span_idx: u32,
+    origin_offset: u32,
+    content_offset: u32,
+    user_idx: u16,
+    deleted: bool,
     _padding: u8,
 }
 
 impl Span {
-    /// Create a new span.
-    pub fn new(
+    fn new(
         user_idx: u16,
         seq: u32,
         len: u32,
@@ -186,42 +137,30 @@ impl Span {
         };
     }
 
-    /// Get the origin reference.
-    pub fn origin(&self) -> OriginRef {
+    fn origin(&self) -> OriginRef {
         return OriginRef {
             span_idx: self.origin_span_idx,
             offset: self.origin_offset,
         };
     }
 
-    /// Set the origin reference.
-    pub fn set_origin(&mut self, origin: OriginRef) {
+    fn set_origin(&mut self, origin: OriginRef) {
         self.origin_span_idx = origin.span_idx;
         self.origin_offset = origin.offset;
     }
 
-    /// Check if this span has an origin.
     #[inline(always)]
-    pub fn has_origin(&self) -> bool {
+    fn has_origin(&self) -> bool {
         return self.origin_span_idx != NO_ORIGIN;
     }
 
-    /// Check if this span contains the given sequence number for the same user.
     #[inline(always)]
-    pub fn contains_seq(&self, seq: u32) -> bool {
+    fn contains_seq(&self, seq: u32) -> bool {
         return seq >= self.seq && seq < self.seq + self.len;
     }
 
-    /// Get the sequence number at a position within this span.
-    #[inline(always)]
-    pub fn seq_at(&self, offset: u32) -> u32 {
-        debug_assert!(offset < self.len);
-        return self.seq + offset;
-    }
-
-    /// Split this span at the given offset, returning the right half.
     #[inline]
-    pub fn split(&mut self, offset: u32) -> Span {
+    fn split(&mut self, offset: u32) -> Span {
         debug_assert!(offset > 0 && offset < self.len);
         let right = Span {
             seq: self.seq + offset,
@@ -237,13 +176,9 @@ impl Span {
         return right;
     }
 
-    /// Visible length (0 if deleted, len otherwise).
     #[inline(always)]
-    pub fn visible_len(&self) -> u32 {
-        if self.deleted {
-            return 0;
-        }
-        return self.len;
+    fn visible_len(&self) -> u32 {
+        if self.deleted { 0 } else { self.len }
     }
 }
 
@@ -402,24 +337,13 @@ impl Rga {
         return idx;
     }
 
-    /// Insert content after the given visible position.
-    /// Position 0 means insert at the beginning.
-    /// Returns the ItemId of the first inserted item.
-    pub fn insert(&mut self, user: &KeyPub, pos: u64, content: &[u8]) -> ItemId {
+    /// Insert content at the given visible position.
+    pub fn insert(&mut self, user: &KeyPub, pos: u64, content: &[u8]) {
         if content.is_empty() {
             panic!("cannot insert empty content");
         }
-
         let user_idx = self.ensure_user(user);
-        let column = &self.columns[user_idx as usize];
-        let seq = column.next_seq;
-        
         self.insert_with_user_idx(user_idx, pos, content);
-        
-        return ItemId {
-            user: *user,
-            seq: seq as u64,
-        };
     }
 
     /// Insert content using a pre-computed user index.

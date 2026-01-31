@@ -1,9 +1,9 @@
 // model = "claude-opus-4-5"
 // created = "2026-01-30"
-// modified = "2026-01-30"
+// modified = "2026-01-31"
 // driver = "Isaac Clayton"
 
-//! Operations that can be stored in a signed append-only log.
+//! Operations for RGA that can be stored in a signed append-only log.
 //!
 //! Each writer produces a sequence of operations that, when replayed,
 //! reconstruct the CRDT state. The key insight is that operations are
