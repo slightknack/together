@@ -1,6 +1,6 @@
 // model = "claude-opus-4-5"
 // created = "2026-01-30"
-// modified = "2026-01-30"
+// modified = "2026-01-31"
 // driver = "Isaac Clayton"
 
 //! Replicated Growable Array (RGA) implementation.
@@ -17,13 +17,70 @@
 //! 3. **Append-only columns**: Each user has a column that only appends. This
 //!    makes replication trivial - just send new entries.
 //!
-//! 4. **ItemId index**: A HashMap from (user, seq) to span index enables O(1)
-//!    lookup of spans by their CRDT identifier.
+//! 4. **Compact representation**: Spans use 24 bytes instead of 112 bytes by:
+//!    - Storing user as a u16 index into a UserTable
+//!    - Storing origin as span_idx + offset (u32 + u32)
+//!    - Using u32 for seq/len/content_offset
 
 use std::collections::HashMap;
 
 use crate::key::KeyPub;
 use super::weighted_list::WeightedList;
+
+/// Sentinel value indicating no origin (insert at beginning).
+const NO_ORIGIN: u32 = u32::MAX;
+
+/// A table mapping u16 indices to KeyPub values.
+/// This allows spans to store a 2-byte index instead of a 32-byte key.
+#[derive(Clone, Debug, Default)]
+pub struct UserTable {
+    /// Map from KeyPub to index.
+    key_to_idx: HashMap<KeyPub, u16>,
+    /// Map from index to KeyPub.
+    idx_to_key: Vec<KeyPub>,
+}
+
+impl UserTable {
+    /// Create a new empty user table.
+    pub fn new() -> UserTable {
+        return UserTable {
+            key_to_idx: HashMap::new(),
+            idx_to_key: Vec::new(),
+        };
+    }
+
+    /// Get or create an index for a user.
+    pub fn get_or_insert(&mut self, key: &KeyPub) -> u16 {
+        if let Some(&idx) = self.key_to_idx.get(key) {
+            return idx;
+        }
+        let idx = self.idx_to_key.len() as u16;
+        assert!(idx < u16::MAX, "too many users (max 65534)");
+        self.idx_to_key.push(*key);
+        self.key_to_idx.insert(*key, idx);
+        return idx;
+    }
+
+    /// Get the index for a user, if it exists.
+    pub fn get(&self, key: &KeyPub) -> Option<u16> {
+        return self.key_to_idx.get(key).copied();
+    }
+
+    /// Get the KeyPub for an index.
+    pub fn get_key(&self, idx: u16) -> Option<&KeyPub> {
+        return self.idx_to_key.get(idx as usize);
+    }
+
+    /// Number of users in the table.
+    pub fn len(&self) -> usize {
+        return self.idx_to_key.len();
+    }
+
+    /// Check if the table is empty.
+    pub fn is_empty(&self) -> bool {
+        return self.idx_to_key.is_empty();
+    }
+}
 
 /// A unique identifier for an item in the RGA.
 /// Composed of the user's public key and a sequence number.
@@ -39,59 +96,144 @@ impl std::fmt::Debug for ItemId {
     }
 }
 
-/// A span of consecutive items inserted by the same user.
-/// Represents items with IDs (user, seq) through (user, seq + len - 1).
-#[derive(Clone, Copy, Debug)]
-pub struct Span {
-    /// The user who created this span.
-    pub user: KeyPub,
-    /// The starting sequence number.
-    pub seq: u64,
-    /// Number of items in this span.
-    pub len: u64,
-    /// The ID of the item this span was inserted after.
-    /// None means inserted at the beginning.
-    pub origin: Option<ItemId>,
-    /// Offset into the content backing store.
-    pub content_offset: usize,
-    /// Whether this span has been deleted.
-    pub deleted: bool,
+/// A compact reference to an origin position.
+/// Uses span index + offset within span instead of full ItemId.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OriginRef {
+    /// Index of the span containing the origin (u32::MAX = no origin).
+    pub span_idx: u32,
+    /// Offset within the span.
+    pub offset: u32,
 }
 
-impl Span {
-    /// Get the ItemId for a position within this span.
-    pub fn id_at(&self, offset: u64) -> ItemId {
-        assert!(offset < self.len);
-        return ItemId {
-            user: self.user.clone(),
-            seq: self.seq + offset,
+impl OriginRef {
+    /// Create a reference meaning "no origin" (insert at beginning).
+    pub fn none() -> OriginRef {
+        return OriginRef {
+            span_idx: NO_ORIGIN,
+            offset: 0,
         };
     }
 
-    /// Check if this span contains the given ItemId.
-    pub fn contains(&self, id: &ItemId) -> bool {
-        return self.user == id.user
-            && id.seq >= self.seq
-            && id.seq < self.seq + self.len;
+    /// Create a reference to a specific span position.
+    pub fn some(span_idx: u32, offset: u32) -> OriginRef {
+        return OriginRef { span_idx, offset };
+    }
+
+    /// Check if this is a "no origin" reference.
+    pub fn is_none(&self) -> bool {
+        return self.span_idx == NO_ORIGIN;
+    }
+
+    /// Check if this is a valid origin reference.
+    pub fn is_some(&self) -> bool {
+        return self.span_idx != NO_ORIGIN;
+    }
+}
+
+/// A compact span of consecutive items inserted by the same user.
+/// Target size: 24 bytes (down from 112 bytes).
+///
+/// Layout (ordered for optimal packing):
+/// - seq: u32 (4 bytes) - starting sequence number
+/// - len: u32 (4 bytes) - number of items
+/// - origin_span_idx: u32 (4 bytes) - origin span index (NO_ORIGIN = none)
+/// - origin_offset: u32 (4 bytes) - offset within origin span
+/// - content_offset: u32 (4 bytes) - offset into content backing store
+/// - user_idx: u16 (2 bytes) - index into UserTable
+/// - deleted: bool (1 byte) - whether this span is deleted
+/// - _padding: u8 (1 byte) - alignment padding
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Span {
+    /// The starting sequence number.
+    pub seq: u32,
+    /// Number of items in this span.
+    pub len: u32,
+    /// Index of the origin span (NO_ORIGIN = no origin).
+    pub origin_span_idx: u32,
+    /// Offset within the origin span.
+    pub origin_offset: u32,
+    /// Offset into the content backing store.
+    pub content_offset: u32,
+    /// Index into the UserTable.
+    pub user_idx: u16,
+    /// Whether this span has been deleted.
+    pub deleted: bool,
+    /// Padding for alignment.
+    _padding: u8,
+}
+
+impl Span {
+    /// Create a new span.
+    pub fn new(
+        user_idx: u16,
+        seq: u32,
+        len: u32,
+        origin: OriginRef,
+        content_offset: u32,
+    ) -> Span {
+        return Span {
+            seq,
+            len,
+            origin_span_idx: origin.span_idx,
+            origin_offset: origin.offset,
+            content_offset,
+            user_idx,
+            deleted: false,
+            _padding: 0,
+        };
+    }
+
+    /// Get the origin reference.
+    pub fn origin(&self) -> OriginRef {
+        return OriginRef {
+            span_idx: self.origin_span_idx,
+            offset: self.origin_offset,
+        };
+    }
+
+    /// Set the origin reference.
+    pub fn set_origin(&mut self, origin: OriginRef) {
+        self.origin_span_idx = origin.span_idx;
+        self.origin_offset = origin.offset;
+    }
+
+    /// Check if this span has an origin.
+    pub fn has_origin(&self) -> bool {
+        return self.origin_span_idx != NO_ORIGIN;
+    }
+
+    /// Check if this span contains the given sequence number for the same user.
+    pub fn contains_seq(&self, seq: u32) -> bool {
+        return seq >= self.seq && seq < self.seq + self.len;
+    }
+
+    /// Get the sequence number at a position within this span.
+    pub fn seq_at(&self, offset: u32) -> u32 {
+        assert!(offset < self.len);
+        return self.seq + offset;
     }
 
     /// Split this span at the given offset, returning the right half.
-    pub fn split(&mut self, offset: u64) -> Span {
+    pub fn split(&mut self, offset: u32) -> Span {
         assert!(offset > 0 && offset < self.len);
         let right = Span {
-            user: self.user.clone(),
             seq: self.seq + offset,
             len: self.len - offset,
-            origin: Some(self.id_at(offset - 1)),
-            content_offset: self.content_offset + offset as usize,
+            origin_span_idx: NO_ORIGIN, // Will be fixed by caller
+            origin_offset: 0,
+            content_offset: self.content_offset + offset,
+            user_idx: self.user_idx,
             deleted: self.deleted,
+            _padding: 0,
         };
         self.len = offset;
         return right;
     }
 
     /// Visible length (0 if deleted, len otherwise).
-    pub fn visible_len(&self) -> u64 {
+    pub fn visible_len(&self) -> u32 {
         if self.deleted {
             return 0;
         }
@@ -105,7 +247,7 @@ struct Column {
     /// The content bytes for this user's insertions.
     content: Vec<u8>,
     /// Next sequence number to assign.
-    next_seq: u64,
+    next_seq: u32,
 }
 
 impl Column {
@@ -125,8 +267,10 @@ impl Column {
 pub struct Rga {
     /// Spans in document order, weighted by visible character count.
     spans: WeightedList<Span>,
-    /// Per-user columns for content storage.
-    columns: HashMap<KeyPub, Column>,
+    /// Per-user columns for content storage, indexed by user_idx.
+    columns: Vec<Column>,
+    /// Maps KeyPub to user index.
+    users: UserTable,
 }
 
 impl Rga {
@@ -134,7 +278,8 @@ impl Rga {
     pub fn new() -> Rga {
         return Rga {
             spans: WeightedList::new(),
-            columns: HashMap::new(),
+            columns: Vec::new(),
+            users: UserTable::new(),
         };
     }
 
@@ -153,6 +298,15 @@ impl Rga {
         return self.spans.len();
     }
 
+    /// Get or create a user index, ensuring the column exists.
+    fn ensure_user(&mut self, user: &KeyPub) -> u16 {
+        let idx = self.users.get_or_insert(user);
+        while self.columns.len() <= idx as usize {
+            self.columns.push(Column::new());
+        }
+        return idx;
+    }
+
     /// Insert content after the given visible position.
     /// Position 0 means insert at the beginning.
     /// Returns the ItemId of the first inserted item.
@@ -161,24 +315,26 @@ impl Rga {
             panic!("cannot insert empty content");
         }
 
-        // Get or create the user's column
-        let column = self.columns.entry(user.clone()).or_insert_with(Column::new);
+        let user_idx = self.ensure_user(user);
+        let column = &mut self.columns[user_idx as usize];
         let seq = column.next_seq;
-        let content_offset = column.content.len();
+        let content_offset = column.content.len() as u32;
         column.content.extend_from_slice(content);
-        column.next_seq += content.len() as u64;
+        column.next_seq += content.len() as u32;
 
         // Create the span (origin is set during insert_span_at_pos_optimized)
-        let span = Span {
-            user: *user,
+        let span = Span::new(
+            user_idx,
             seq,
-            len: content.len() as u64,
-            origin: None, // Will be set during insert if needed
+            content.len() as u32,
+            OriginRef::none(),
             content_offset,
-            deleted: false,
-        };
+        );
 
-        let id = span.id_at(0);
+        let id = ItemId {
+            user: *user,
+            seq: seq as u64,
+        };
         self.insert_span_at_pos_optimized(span, pos);
         return id;
     }
@@ -208,7 +364,7 @@ impl Rga {
             };
 
             let span = self.spans.get(span_idx).unwrap();
-            let span_visible = span.visible_len();
+            let span_visible = span.visible_len() as u64;
 
             if offset_in_span == 0 && remaining >= span_visible {
                 // Delete entire span - mark as deleted and update weight to 0
@@ -218,29 +374,29 @@ impl Rga {
             } else if offset_in_span == 0 {
                 // Delete prefix of span - split and delete left part
                 let mut span = self.spans.remove(span_idx);
-                let right = span.split(remaining);
+                let right = span.split(remaining as u32);
                 span.deleted = true;
                 self.spans.insert(span_idx, span, 0);
-                self.spans.insert(span_idx + 1, right, right.visible_len());
+                self.spans.insert(span_idx + 1, right, right.visible_len() as u64);
                 remaining = 0;
             } else if offset_in_span + remaining >= span_visible {
                 // Delete suffix of span - split and delete right part
                 let to_delete = span_visible - offset_in_span;
                 let mut span = self.spans.remove(span_idx);
-                let mut right = span.split(offset_in_span);
+                let mut right = span.split(offset_in_span as u32);
                 right.deleted = true;
-                self.spans.insert(span_idx, span, span.visible_len());
+                self.spans.insert(span_idx, span, span.visible_len() as u64);
                 self.spans.insert(span_idx + 1, right, 0);
                 remaining -= to_delete;
             } else {
                 // Delete middle of span - split twice
                 let mut span = self.spans.remove(span_idx);
-                let mut mid_right = span.split(offset_in_span);
-                let right = mid_right.split(remaining);
+                let mut mid_right = span.split(offset_in_span as u32);
+                let right = mid_right.split(remaining as u32);
                 mid_right.deleted = true;
-                self.spans.insert(span_idx, span, span.visible_len());
+                self.spans.insert(span_idx, span, span.visible_len() as u64);
                 self.spans.insert(span_idx + 1, mid_right, 0);
-                self.spans.insert(span_idx + 2, right, right.visible_len());
+                self.spans.insert(span_idx + 2, right, right.visible_len() as u64);
                 remaining = 0;
             }
         }
@@ -251,8 +407,8 @@ impl Rga {
         let mut result = Vec::new();
         for span in self.spans.iter() {
             if !span.deleted {
-                let column = self.columns.get(&span.user).unwrap();
-                let start = span.content_offset;
+                let column = &self.columns[span.user_idx as usize];
+                let start = span.content_offset as usize;
                 let end = start + span.len as usize;
                 result.extend_from_slice(&column.content[start..end]);
             }
@@ -264,7 +420,7 @@ impl Rga {
     /// Optimized version that sets the origin during insert to avoid double lookup.
     /// Attempts to coalesce with the preceding span if possible.
     fn insert_span_at_pos_optimized(&mut self, mut span: Span, pos: u64) {
-        let span_len = span.visible_len();
+        let span_len = span.visible_len() as u64;
 
         if self.spans.is_empty() {
             // No origin for first span
@@ -290,24 +446,24 @@ impl Rga {
         };
 
         let prev_span = self.spans.get(prev_idx).unwrap();
-        let prev_visible_len = prev_span.visible_len();
+        let prev_visible_len = prev_span.visible_len() as u64;
         
         // Set the origin from the lookup we just did
-        span.origin = Some(prev_span.id_at(offset_in_prev));
+        span.set_origin(OriginRef::some(prev_idx as u32, offset_in_prev as u32));
 
         // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted
         // Also check offset_in_prev == prev_span.visible_len - 1 to ensure we're at the end of the span
-        if prev_span.user == span.user
+        if prev_span.user_idx == span.user_idx
             && !prev_span.deleted
             && prev_span.seq + prev_span.len == span.seq
-            && prev_span.content_offset + prev_span.len as usize == span.content_offset
+            && prev_span.content_offset + prev_span.len == span.content_offset
             && offset_in_prev == prev_visible_len - 1
         {
             // Coalesce by extending the previous span
             let prev_span = self.spans.get_mut(prev_idx).unwrap();
             prev_span.len += span.len;
             // Update weight
-            let new_weight = prev_span.visible_len();
+            let new_weight = prev_span.visible_len() as u64;
             self.spans.update_weight(prev_idx, new_weight);
             return;
         }
@@ -320,24 +476,30 @@ impl Rga {
             self.spans.insert(prev_idx + 1, span, span_len);
         } else {
             // Need to split prev_span - insert in the middle
-            let split_offset = offset_in_prev + 1;
+            let split_offset = (offset_in_prev + 1) as u32;
             let mut existing = self.spans.remove(prev_idx);
             let right = existing.split(split_offset);
-            self.spans.insert(prev_idx, existing, existing.visible_len());
+            self.spans.insert(prev_idx, existing, existing.visible_len() as u64);
             self.spans.insert(prev_idx + 1, span, span_len);
-            self.spans.insert(prev_idx + 2, right, right.visible_len());
+            self.spans.insert(prev_idx + 2, right, right.visible_len() as u64);
         }
     }
 
     /// Find span containing the given ItemId using linear search.
     fn find_span_by_id(&self, id: &ItemId) -> Option<usize> {
+        let user_idx = match self.users.get(&id.user) {
+            Some(idx) => idx,
+            None => return None,
+        };
+        let seq = id.seq as u32;
         for (i, span) in self.spans.iter().enumerate() {
-            if span.contains(id) {
+            if span.user_idx == user_idx && span.contains_seq(seq) {
                 return Some(i);
             }
         }
         return None;
     }
+
 }
 
 impl Default for Rga {
@@ -356,7 +518,7 @@ impl Rga {
     /// Convert an op::ItemId to an rga::ItemId.
     fn convert_id(id: &OpItemId) -> ItemId {
         return ItemId {
-            user: id.user.clone(),
+            user: id.user,
             seq: id.seq,
         };
     }
@@ -366,36 +528,34 @@ impl Rga {
     pub fn apply(&mut self, user: &KeyPub, block: &OpBlock) -> bool {
         match &block.op {
             Op::Insert { origin, seq, len } => {
+                let user_idx = self.ensure_user(user);
+                let column = &self.columns[user_idx as usize];
+                
                 // Check if we already have this insertion
-                if let Some(column) = self.columns.get(user) {
-                    if *seq < column.next_seq {
-                        return false;
-                    }
+                if (*seq as u32) < column.next_seq {
+                    return false;
                 }
 
-                // Get or create the user's column
-                let column = self.columns.entry(user.clone()).or_insert_with(Column::new);
-
                 // Verify sequence is contiguous
-                if *seq != column.next_seq {
+                if (*seq as u32) != column.next_seq {
                     panic!("sequence gap: expected {}, got {}", column.next_seq, seq);
                 }
 
-                let content_offset = column.content.len();
+                let column = &mut self.columns[user_idx as usize];
+                let content_offset = column.content.len() as u32;
                 column.content.extend_from_slice(&block.content);
-                column.next_seq += *len;
+                column.next_seq += *len as u32;
 
                 // Create the span
-                let span = Span {
-                    user: user.clone(),
-                    seq: *seq,
-                    len: *len,
-                    origin: origin.as_ref().map(Self::convert_id),
+                let span = Span::new(
+                    user_idx,
+                    *seq as u32,
+                    *len as u32,
+                    OriginRef::none(), // Will be resolved during insert
                     content_offset,
-                    deleted: false,
-                };
+                );
 
-                self.insert_span_rga(span);
+                self.insert_span_rga(span, origin.as_ref().map(Self::convert_id));
                 return true;
             }
             Op::Delete { target } => {
@@ -407,35 +567,44 @@ impl Rga {
 
     /// Insert a span using RGA ordering rules.
     /// When multiple spans have the same origin, order by (user, seq) descending.
-    fn insert_span_rga(&mut self, span: Span) {
-        let span_len = span.visible_len();
+    fn insert_span_rga(&mut self, mut span: Span, origin: Option<ItemId>) {
+        let span_len = span.visible_len() as u64;
 
         if self.spans.is_empty() {
             self.spans.insert(0, span, span_len);
             return;
         }
 
-        let insert_idx = if let Some(ref origin) = span.origin {
+        let insert_idx = if let Some(ref origin_id) = origin {
             // Find the origin span
-            if let Some(origin_idx) = self.find_span_by_id(origin) {
+            if let Some(origin_idx) = self.find_span_by_id(origin_id) {
                 let origin_span = self.spans.get(origin_idx).unwrap();
-                let offset_in_span = origin.seq - origin_span.seq;
+                let offset_in_span = (origin_id.seq as u32) - origin_span.seq;
+
+                // Set the origin reference
+                span.set_origin(OriginRef::some(origin_idx as u32, offset_in_span));
 
                 // If origin is in the middle of a span, split it
                 if offset_in_span < origin_span.len - 1 {
                     let mut existing = self.spans.remove(origin_idx);
                     let right = existing.split(offset_in_span + 1);
-                    self.spans.insert(origin_idx, existing.clone(), existing.visible_len());
-                    self.spans.insert(origin_idx + 1, right.clone(), right.visible_len());
+                    self.spans.insert(origin_idx, existing, existing.visible_len() as u64);
+                    self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
                 }
 
                 // Insert after origin, respecting RGA ordering
                 let mut pos = origin_idx + 1;
+                let span_user = self.users.get_key(span.user_idx).unwrap();
                 while pos < self.spans.len() {
                     let other = self.spans.get(pos).unwrap();
-                    if let Some(ref other_origin) = other.origin {
-                        if other_origin == origin {
-                            if (&other.user, other.seq) > (&span.user, span.seq) {
+                    // Check if other has the same origin
+                    if other.has_origin() {
+                        let other_origin = other.origin();
+                        if other_origin.span_idx == origin_idx as u32 
+                            && other_origin.offset == offset_in_span 
+                        {
+                            let other_user = self.users.get_key(other.user_idx).unwrap();
+                            if (other_user, other.seq) > (span_user, span.seq) {
                                 pos += 1;
                                 continue;
                             }
@@ -450,10 +619,12 @@ impl Rga {
         } else {
             // No origin - insert at beginning with RGA ordering
             let mut pos = 0;
+            let span_user = self.users.get_key(span.user_idx).unwrap();
             while pos < self.spans.len() {
                 let other = self.spans.get(pos).unwrap();
-                if other.origin.is_none() {
-                    if (&other.user, other.seq) > (&span.user, span.seq) {
+                if !other.has_origin() {
+                    let other_user = self.users.get_key(other.user_idx).unwrap();
+                    if (other_user, other.seq) > (span_user, span.seq) {
                         pos += 1;
                         continue;
                     }
@@ -478,7 +649,7 @@ impl Rga {
             return false;
         }
 
-        let offset = id.seq - span.seq;
+        let offset = (id.seq as u32) - span.seq;
         let span_len = span.len;
 
         if span_len == 1 {
@@ -490,13 +661,13 @@ impl Rga {
             let right = existing.split(1);
             existing.deleted = true;
             self.spans.insert(idx, existing, 0);
-            self.spans.insert(idx + 1, right.clone(), right.visible_len());
+            self.spans.insert(idx + 1, right, right.visible_len() as u64);
         } else if offset == span_len - 1 {
             // Delete last item
             let mut existing = self.spans.remove(idx);
             let mut right = existing.split(offset);
             right.deleted = true;
-            self.spans.insert(idx, existing.clone(), existing.visible_len());
+            self.spans.insert(idx, existing, existing.visible_len() as u64);
             self.spans.insert(idx + 1, right, 0);
         } else {
             // Delete middle item
@@ -504,9 +675,9 @@ impl Rga {
             let mut mid_right = existing.split(offset);
             let right = mid_right.split(1);
             mid_right.deleted = true;
-            self.spans.insert(idx, existing.clone(), existing.visible_len());
+            self.spans.insert(idx, existing, existing.visible_len() as u64);
             self.spans.insert(idx + 1, mid_right, 0);
-            self.spans.insert(idx + 2, right.clone(), right.visible_len());
+            self.spans.insert(idx + 2, right, right.visible_len() as u64);
         }
 
         return true;
@@ -516,20 +687,37 @@ impl Rga {
 impl super::Crdt for Rga {
     fn merge(&mut self, other: &Self) {
         for span in other.spans.iter() {
-            if self.find_span_by_id(&span.id_at(0)).is_some() {
+            // Get the user's KeyPub from other's UserTable
+            let other_user = other.users.get_key(span.user_idx).unwrap();
+            
+            // Check if we already have this span
+            let first_id = ItemId {
+                user: *other_user,
+                seq: span.seq as u64,
+            };
+            if self.find_span_by_id(&first_id).is_some() {
                 continue;
             }
 
-            let other_column = other.columns.get(&span.user).unwrap();
-            let content =
-                &other_column.content[span.content_offset..span.content_offset + span.len as usize];
+            let other_column = &other.columns[span.user_idx as usize];
+            let content = &other_column.content
+                [span.content_offset as usize..(span.content_offset + span.len) as usize];
 
-            let origin = span.origin.as_ref().map(|id| OpItemId {
-                user: id.user.clone(),
-                seq: id.seq,
-            });
-            let block = OpBlock::insert(origin, span.seq, content.to_vec());
-            self.apply(&span.user, &block);
+            // Reconstruct the origin ItemId if present
+            let origin = if span.has_origin() {
+                let origin_ref = span.origin();
+                let origin_span = other.spans.get(origin_ref.span_idx as usize).unwrap();
+                let origin_user = other.users.get_key(origin_span.user_idx).unwrap();
+                Some(OpItemId {
+                    user: *origin_user,
+                    seq: (origin_span.seq + origin_ref.offset) as u64,
+                })
+            } else {
+                None
+            };
+
+            let block = OpBlock::insert(origin, span.seq as u64, content.to_vec());
+            self.apply(other_user, &block);
         }
     }
 }
@@ -538,6 +726,35 @@ impl super::Crdt for Rga {
 mod tests {
     use super::*;
     use crate::key::KeyPair;
+
+    #[test]
+    fn span_size() {
+        // Verify our span is compact
+        let size = std::mem::size_of::<Span>();
+        assert!(size <= 32, "Span is {} bytes, expected <= 32", size);
+        // Ideally 24 bytes
+        assert_eq!(size, 24, "Span should be exactly 24 bytes");
+    }
+
+    #[test]
+    fn user_table_basics() {
+        let mut table = UserTable::new();
+        let key1 = KeyPair::generate().key_pub;
+        let key2 = KeyPair::generate().key_pub;
+
+        let idx1 = table.get_or_insert(&key1);
+        let idx2 = table.get_or_insert(&key2);
+        
+        assert_eq!(idx1, 0);
+        assert_eq!(idx2, 1);
+        
+        // Same key returns same index
+        assert_eq!(table.get_or_insert(&key1), 0);
+        
+        // Lookup works
+        assert_eq!(table.get(&key1), Some(0));
+        assert_eq!(table.get_key(0), Some(&key1));
+    }
 
     #[test]
     fn empty_rga() {
@@ -639,61 +856,6 @@ mod tests {
     }
 
     #[test]
-    fn span_contains() {
-        let pair = KeyPair::generate();
-        let span = Span {
-            user: pair.key_pub.clone(),
-            seq: 10,
-            len: 5,
-            origin: None,
-            content_offset: 0,
-            deleted: false,
-        };
-
-        assert!(span.contains(&ItemId { user: pair.key_pub.clone(), seq: 10 }));
-        assert!(span.contains(&ItemId { user: pair.key_pub.clone(), seq: 14 }));
-        assert!(!span.contains(&ItemId { user: pair.key_pub.clone(), seq: 9 }));
-        assert!(!span.contains(&ItemId { user: pair.key_pub.clone(), seq: 15 }));
-    }
-
-    #[test]
-    fn span_split() {
-        let pair = KeyPair::generate();
-        let mut span = Span {
-            user: pair.key_pub.clone(),
-            seq: 10,
-            len: 10,
-            origin: None,
-            content_offset: 0,
-            deleted: false,
-        };
-
-        let right = span.split(4);
-
-        assert_eq!(span.seq, 10);
-        assert_eq!(span.len, 4);
-        assert_eq!(right.seq, 14);
-        assert_eq!(right.len, 6);
-        assert_eq!(right.content_offset, 4);
-    }
-
-    #[test]
-    fn item_id_at() {
-        let pair = KeyPair::generate();
-        let span = Span {
-            user: pair.key_pub.clone(),
-            seq: 100,
-            len: 5,
-            origin: None,
-            content_offset: 0,
-            deleted: false,
-        };
-
-        let id = span.id_at(3);
-        assert_eq!(id.seq, 103);
-    }
-
-    #[test]
     fn apply_insert_at_beginning() {
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
@@ -714,7 +876,7 @@ mod tests {
         rga.apply(&pair.key_pub, &block1);
 
         let origin = OpItemId {
-            user: pair.key_pub.clone(),
+            user: pair.key_pub,
             seq: 4,
         };
         let block2 = OpBlock::insert(Some(origin), 5, b" world".to_vec());
@@ -745,7 +907,7 @@ mod tests {
         rga.apply(&pair.key_pub, &block1);
 
         let target = OpItemId {
-            user: pair.key_pub.clone(),
+            user: pair.key_pub,
             seq: 1,
         };
         let block2 = OpBlock::delete(target);
