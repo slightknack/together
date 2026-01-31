@@ -260,13 +260,6 @@ impl Rga {
         return String::from_utf8(result).unwrap_or_default();
     }
 
-    /// Get the ItemId at a visible position.
-    fn id_at_visible_pos(&mut self, pos: u64) -> ItemId {
-        let (span_idx, offset) = self.spans.find_by_weight(pos)
-            .expect("position out of bounds");
-        return self.spans.get(span_idx).unwrap().id_at(offset);
-    }
-
     /// Insert a span at the given visible position (for local edits).
     /// Optimized version that sets the origin during insert to avoid double lookup.
     /// Attempts to coalesce with the preceding span if possible.
@@ -333,38 +326,6 @@ impl Rga {
             self.spans.insert(prev_idx, existing, existing.visible_len());
             self.spans.insert(prev_idx + 1, span, span_len);
             self.spans.insert(prev_idx + 2, right, right.visible_len());
-        }
-    }
-
-    /// Insert a span at the given visible position (for local edits).
-    /// Used by RGA apply for remote operations where origin is already set.
-    fn insert_span_at_pos(&mut self, span: Span, pos: u64) {
-        let span_len = span.visible_len();
-
-        if self.spans.is_empty() || pos == 0 {
-            self.spans.insert(0, span, span_len);
-            return;
-        }
-
-        // Find where to insert by weight position
-        match self.spans.find_by_weight(pos) {
-            Some((idx, offset_in_span)) => {
-                if offset_in_span > 0 {
-                    // Need to split the span
-                    let mut existing = self.spans.remove(idx);
-                    let right = existing.split(offset_in_span);
-                    self.spans.insert(idx, existing, existing.visible_len());
-                    self.spans.insert(idx + 1, span, span_len);
-                    self.spans.insert(idx + 2, right, right.visible_len());
-                } else {
-                    // Insert before this span
-                    self.spans.insert(idx, span, span_len);
-                }
-            }
-            None => {
-                // pos >= total_weight, insert at end
-                self.spans.insert(self.spans.len(), span, span_len);
-            }
         }
     }
 
