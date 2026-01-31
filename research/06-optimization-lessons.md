@@ -9,7 +9,17 @@ driver = "Isaac Clayton"
 
 ## Summary
 
-Optimized the RGA implementation from 347x slower than diamond-types to 4.5x slower, a 77x speedup.
+Optimized the RGA implementation from 347x slower than diamond-types to 2.3x slower, a **150x speedup**.
+
+### Optimization Progression
+
+| Optimization | Time | Ratio vs Diamond | Speedup |
+|-------------|------|------------------|---------|
+| Baseline (Vec) | 465ms | 347x slower | - |
+| Chunked weighted list | 6.8ms | 5.1x slower | 68x |
+| Span coalescing | 3.25ms | 2.8x slower | 1.9x |
+| Combined origin/insert lookup | 2.66ms | 2.3x slower | 1.22x |
+| **Total** | 2.66ms | 2.3x slower | **150x** |
 
 ## Key Lessons
 
@@ -94,30 +104,34 @@ Attempted binary search over chunk weights, but it was slower than linear scan b
 
 To make binary search work, would need to maintain a separate prefix sum array and keep it updated on modifications.
 
-## What Would Close the Remaining 4.5x Gap
+## What Would Close the Remaining 2.3x Gap
 
 To match diamond-types performance, would likely need:
 
-1. B-tree or rope structure for true O(log n) with good constants
-2. Span coalescing to reduce fragmentation  
-3. More sophisticated caching (cursor + chunk + weight prefix sums)
-4. Careful memory layout optimization
-5. Possibly SIMD for weight summation
+1. Skip list for true O(log n) lookups (vs O(sqrt n) chunked list)
+2. Fenwick tree for O(log n) prefix sum queries over chunk weights
+3. Smaller Span struct to reduce memory traffic
+4. Gap buffer per chunk for sequential local edits
 
-Diamond-types is highly optimized production code. Getting within 4.5x with straightforward Rust is a reasonable result.
+Diamond-types uses JumpRope: a skip list where each leaf node contains a gap buffer. This gives O(log n) navigation plus O(1) local edits.
 
-### Additional Optimizations Applied
+### Optimizations Applied
 
-After initial chunked implementation:
+1. **Chunked weighted list** (68x speedup): O(sqrt n) operations instead of O(n)
+2. **Span coalescing** (1.9x speedup): 79% of inserts extend existing spans instead of creating new ones
+3. **Combined origin/insert lookup** (1.22x speedup): Single find_by_weight call serves origin lookup, coalescing check, and insert position
+4. Made `Span` and `ItemId` Copy to avoid heap allocations
+5. Combined weight and item counting in `find_chunk_by_weight`
 
-1. Made `Span` and `ItemId` Copy to avoid heap allocations on clone
-2. Combined weight and item counting in `find_chunk_by_weight` to avoid double iteration
-3. Removed unnecessary clone calls throughout
+### Optimizations Attempted but Reverted
+
+1. **Binary search over chunks**: Slower because each step recalculates prefix sums O(n)
+2. **Inline hints**: No effect (compiler already inlined)
+3. **Skip list**: 3x slower than Vec due to overhead for this workload size
 
 Final performance:
-- Insert: 217ns avg
-- Delete: 641ns avg  
-- Total: 6ms for 19,749 patches (vs 1.4ms for diamond-types)
+- Total: 2.66ms for 19,749 patches (vs 1.16ms for diamond-types)
+- 2.3x slower than diamond-types, down from 347x
 
 ## Applicable General Tips
 
