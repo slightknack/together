@@ -24,6 +24,8 @@
 
 use std::collections::HashMap;
 
+use smallvec::SmallVec;
+
 use crate::key::KeyPub;
 use super::weighted_list::WeightedList;
 
@@ -592,11 +594,12 @@ impl Rga {
             && offset_in_prev == prev_visible_len - 1
         {
             // Coalesce by extending the previous span
-            let prev_span = self.spans.get_mut(prev_idx).unwrap();
-            prev_span.len += span.len;
-            // Update weight
-            let new_weight = prev_span.visible_len() as u64;
-            self.spans.update_weight(prev_idx, new_weight);
+            // Use modify_and_update_weight to avoid two chunk lookups
+            let add_len = span.len;
+            let new_weight = self.spans.modify_and_update_weight(prev_idx, |prev_span| {
+                prev_span.len += add_len;
+                prev_span.visible_len() as u64
+            }).unwrap();
             
             // Update cache: point to end of the coalesced span
             // After insert at pos with span_len, the last inserted char is at pos + span_len - 1
@@ -848,7 +851,9 @@ struct PendingInsert {
     /// The starting position.
     pos: u64,
     /// The accumulated content bytes.
-    content: Vec<u8>,
+    /// SmallVec avoids heap allocation for small inserts (most are 1-byte).
+    /// 32 bytes inline = fits typical typing bursts without allocation.
+    content: SmallVec<[u8; 32]>,
 }
 
 /// A buffered wrapper around Rga that batches adjacent operations.
@@ -921,7 +926,7 @@ impl RgaBuf {
         self.pending = Some(PendingInsert {
             user_idx,
             pos,
-            content: content.to_vec(),
+            content: SmallVec::from_slice(content),
         });
     }
 
@@ -1583,7 +1588,7 @@ mod rga_buf_tests {
         
         // Should be buffered, not yet in RGA
         assert!(buf.pending.is_some());
-        assert_eq!(buf.pending.as_ref().unwrap().content, b"hello");
+        assert_eq!(buf.pending.as_ref().unwrap().content.as_slice(), b"hello");
         
         // Flush and verify
         assert_eq!(buf.to_string(), "hello");
@@ -1640,7 +1645,7 @@ mod rga_buf_tests {
         
         // Pending should still be "hello"
         assert!(buf.pending.is_some());
-        assert_eq!(buf.pending.as_ref().unwrap().content, b"hello");
+        assert_eq!(buf.pending.as_ref().unwrap().content.as_slice(), b"hello");
     }
 
     #[test]

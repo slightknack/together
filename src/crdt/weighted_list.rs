@@ -21,8 +21,9 @@ const MAX_CHUNK_SIZE: usize = 128;
 
 /// Threshold for switching from linear scan to Fenwick tree.
 /// For small chunk counts, O(n) linear scan with good constants beats O(log n) with overhead.
-/// sveltecomponent has ~59 chunks, seph-blog1 has ~168 chunks.
-const FENWICK_THRESHOLD: usize = 64;
+/// With TARGET_CHUNK_SIZE=64: sveltecomponent ~92 chunks, rustcode ~196 chunks, seph-blog1 ~243 chunks.
+/// Linear scan is competitive up to ~128 chunks due to Fenwick tree overhead.
+const FENWICK_THRESHOLD: usize = 128;
 
 /// Fenwick Tree (Binary Indexed Tree) for O(log n) prefix sum queries and updates.
 ///
@@ -68,13 +69,15 @@ impl FenwickTree {
     }
 
     /// Find the first index where prefix_sum(index) > target.
-    /// Returns the number of elements if no such index exists.
+    /// Returns (index, prefix_sum_before_index).
+    /// If no such index exists, returns (n, total_sum).
     ///
     /// This uses a more efficient O(log n) algorithm that descends the tree
     /// directly rather than binary searching with prefix_sum calls.
-    fn find_first_exceeding(&self, target: u64) -> usize {
+    /// By returning the prefix sum, we avoid a second O(log n) query.
+    fn find_first_exceeding_with_sum(&self, target: u64) -> (usize, u64) {
         if self.tree.len() <= 1 {
-            return 0;
+            return (0, 0);
         }
 
         let n = self.tree.len() - 1;
@@ -98,9 +101,9 @@ impl FenwickTree {
         }
 
         // pos is now the largest index where prefix_sum(pos) <= target
-        // So pos + 1 is the first index where prefix_sum > target (in 1-indexed terms)
-        // Convert back to 0-indexed: the answer is pos (since prefix_sum(pos) in 0-indexed = sum up to pos)
-        return pos;
+        // sum is the prefix_sum at pos (which is the sum BEFORE the result index)
+        // The result index is pos (0-indexed)
+        return (pos, sum);
     }
 
     /// Build a Fenwick tree from an iterator of values.
@@ -264,14 +267,8 @@ impl<T> WeightedList<T> {
 
         if self.use_fenwick {
             // Use Fenwick tree to find the chunk in O(log n)
-            let chunk_idx = self.chunk_weights.find_first_exceeding(pos);
-
-            // Compute the weight before this chunk using Fenwick tree in O(log n)
-            let weight_before = if chunk_idx == 0 {
-                0
-            } else {
-                self.chunk_weights.prefix_sum(chunk_idx - 1)
-            };
+            // This returns both the chunk index and the weight before it in one traversal
+            let (chunk_idx, weight_before) = self.chunk_weights.find_first_exceeding_with_sum(pos);
 
             // Compute items before this chunk using Fenwick tree in O(log n)
             let items_before = if chunk_idx == 0 {
@@ -308,16 +305,10 @@ impl<T> WeightedList<T> {
 
         if self.use_fenwick {
             // Use Fenwick tree to find the chunk in O(log n)
-            let chunk_idx = self.chunk_counts.find_first_exceeding(index as u64);
+            // This returns both the chunk index and the items before it in one traversal
+            let (chunk_idx, items_before) = self.chunk_counts.find_first_exceeding_with_sum(index as u64);
 
-            // Compute items before this chunk using Fenwick tree in O(log n)
-            let items_before = if chunk_idx == 0 {
-                0
-            } else {
-                self.chunk_counts.prefix_sum(chunk_idx - 1) as usize
-            };
-
-            return (chunk_idx, index - items_before);
+            return (chunk_idx, index - items_before as usize);
         } else {
             // Linear scan for small chunk counts - O(n) but with good constants
             let mut items_before = 0usize;
@@ -399,6 +390,39 @@ impl<T> WeightedList<T> {
         self.chunks[chunk_idx].get_mut(idx_in_chunk)
     }
 
+    /// Get a mutable reference and update the weight in a single operation.
+    /// This avoids the overhead of two separate chunk lookups.
+    /// The callback receives a mutable reference to the item and should return the new weight.
+    /// Returns the new weight on success, None if index is out of bounds.
+    pub fn modify_and_update_weight<F>(&mut self, index: usize, f: F) -> Option<u64>
+    where
+        F: FnOnce(&mut T) -> u64,
+    {
+        if index >= self.len {
+            return None;
+        }
+        let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
+        let chunk = &mut self.chunks[chunk_idx];
+        let (item, old_weight) = &mut chunk.items[idx_in_chunk];
+        let old = *old_weight;
+        
+        // Call the callback to modify the item and get the new weight
+        let new_weight = f(item);
+        
+        // Update weights
+        *old_weight = new_weight;
+        chunk.total_weight = chunk.total_weight - old + new_weight;
+        self.total_weight = self.total_weight - old + new_weight;
+        
+        // Update Fenwick tree with the weight delta (only if using Fenwick)
+        if self.use_fenwick {
+            let delta = new_weight as i64 - old as i64;
+            self.chunk_weights.update(chunk_idx, delta);
+        }
+        
+        return Some(new_weight);
+    }
+
     /// Update the weight of an item at the given index.
     pub fn update_weight(&mut self, index: usize, new_weight: u64) -> u64 {
         let (chunk_idx, idx_in_chunk) = self.find_chunk_by_index(index);
@@ -472,8 +496,8 @@ mod tests {
         let mut tree = FenwickTree::new(1);
         tree.update(0, 5);
         assert_eq!(tree.prefix_sum(0), 5);
-        assert_eq!(tree.find_first_exceeding(4), 0);
-        assert_eq!(tree.find_first_exceeding(5), 1);
+        assert_eq!(tree.find_first_exceeding_with_sum(4), (0, 0));
+        assert_eq!(tree.find_first_exceeding_with_sum(5), (1, 5));
     }
 
     #[test]
@@ -505,17 +529,17 @@ mod tests {
         tree.update(3, 7);
         tree.update(4, 1);
 
-        // find_first_exceeding(target) returns first i where prefix_sum(i) > target
-        assert_eq!(tree.find_first_exceeding(0), 0);   // prefix_sum(0)=3 > 0
-        assert_eq!(tree.find_first_exceeding(2), 0);   // prefix_sum(0)=3 > 2
-        assert_eq!(tree.find_first_exceeding(3), 1);   // prefix_sum(1)=8 > 3
-        assert_eq!(tree.find_first_exceeding(7), 1);   // prefix_sum(1)=8 > 7
-        assert_eq!(tree.find_first_exceeding(8), 2);   // prefix_sum(2)=10 > 8
-        assert_eq!(tree.find_first_exceeding(9), 2);   // prefix_sum(2)=10 > 9
-        assert_eq!(tree.find_first_exceeding(10), 3);  // prefix_sum(3)=17 > 10
-        assert_eq!(tree.find_first_exceeding(16), 3);  // prefix_sum(3)=17 > 16
-        assert_eq!(tree.find_first_exceeding(17), 4);  // prefix_sum(4)=18 > 17
-        assert_eq!(tree.find_first_exceeding(18), 5);  // no index exceeds 18
+        // find_first_exceeding_with_sum(target) returns (first i where prefix_sum(i) > target, sum_before_i)
+        assert_eq!(tree.find_first_exceeding_with_sum(0).0, 0);   // prefix_sum(0)=3 > 0
+        assert_eq!(tree.find_first_exceeding_with_sum(2).0, 0);   // prefix_sum(0)=3 > 2
+        assert_eq!(tree.find_first_exceeding_with_sum(3).0, 1);   // prefix_sum(1)=8 > 3
+        assert_eq!(tree.find_first_exceeding_with_sum(7).0, 1);   // prefix_sum(1)=8 > 7
+        assert_eq!(tree.find_first_exceeding_with_sum(8).0, 2);   // prefix_sum(2)=10 > 8
+        assert_eq!(tree.find_first_exceeding_with_sum(9).0, 2);   // prefix_sum(2)=10 > 9
+        assert_eq!(tree.find_first_exceeding_with_sum(10).0, 3);  // prefix_sum(3)=17 > 10
+        assert_eq!(tree.find_first_exceeding_with_sum(16).0, 3);  // prefix_sum(3)=17 > 16
+        assert_eq!(tree.find_first_exceeding_with_sum(17).0, 4);  // prefix_sum(4)=18 > 17
+        assert_eq!(tree.find_first_exceeding_with_sum(18).0, 5);  // no index exceeds 18
     }
 
     #[test]
@@ -572,10 +596,10 @@ mod tests {
         assert_eq!(tree.prefix_sum(5), 10);
 
         // Find should skip zero-weight elements correctly
-        assert_eq!(tree.find_first_exceeding(4), 0);  // prefix_sum(0)=5 > 4
-        assert_eq!(tree.find_first_exceeding(5), 3);  // prefix_sum(3)=8 > 5
-        assert_eq!(tree.find_first_exceeding(7), 3);  // prefix_sum(3)=8 > 7
-        assert_eq!(tree.find_first_exceeding(8), 5);  // prefix_sum(5)=10 > 8
+        assert_eq!(tree.find_first_exceeding_with_sum(4).0, 0);  // prefix_sum(0)=5 > 4
+        assert_eq!(tree.find_first_exceeding_with_sum(5).0, 3);  // prefix_sum(3)=8 > 5
+        assert_eq!(tree.find_first_exceeding_with_sum(7).0, 3);  // prefix_sum(3)=8 > 7
+        assert_eq!(tree.find_first_exceeding_with_sum(8).0, 5);  // prefix_sum(5)=10 > 8
     }
 
     // --- WeightedList tests ---
