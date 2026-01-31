@@ -910,6 +910,22 @@ struct PendingInsert {
     content: SmallVec<[u8; 32]>,
 }
 
+/// A pending delete operation waiting to be flushed.
+#[derive(Clone, Debug)]
+struct PendingDelete {
+    /// The starting position of the delete range.
+    start: u64,
+    /// The length of the delete range.
+    len: u64,
+}
+
+/// Pending operation type for RgaBuf.
+#[derive(Clone, Debug)]
+enum PendingOp {
+    Insert(PendingInsert),
+    Delete(PendingDelete),
+}
+
 /// A buffered wrapper around Rga that batches adjacent operations.
 ///
 /// Text editing traces show strong locality: sequential typing inserts at
@@ -918,6 +934,8 @@ struct PendingInsert {
 ///
 /// This wrapper also optimizes:
 /// - Backspace at end of pending insert: trim buffer instead of flush+delete
+/// - Adjacent deletes (backspace): buffer deletes at P, P-1, P-2...
+/// - Adjacent deletes (forward delete): buffer deletes at P, P, P...
 ///
 /// JumpRopeBuf (used by diamond-types) achieves ~10x speedup for sequential
 /// editing patterns using this technique.
@@ -925,12 +943,12 @@ struct PendingInsert {
 /// Usage:
 /// - Use `insert` and `delete` as normal
 /// - Call `flush` before any read operation (len, to_string)
-/// - The wrapper automatically flushes when switching users or positions
+/// - The wrapper automatically flushes when switching between insert/delete
 pub struct RgaBuf {
     /// The underlying RGA.
     rga: Rga,
-    /// Pending insert operation, if any.
-    pending: Option<PendingInsert>,
+    /// Pending operation, if any.
+    pending: Option<PendingOp>,
 }
 
 impl RgaBuf {
@@ -945,9 +963,17 @@ impl RgaBuf {
     /// Flush any pending operation to the underlying RGA.
     pub fn flush(&mut self) {
         if let Some(pending) = self.pending.take() {
-            if !pending.content.is_empty() {
-                // Use insert_with_user_idx to avoid redundant HashMap lookup
-                self.rga.insert_with_user_idx(pending.user_idx, pending.pos, &pending.content);
+            match pending {
+                PendingOp::Insert(ins) => {
+                    if !ins.content.is_empty() {
+                        self.rga.insert_with_user_idx(ins.user_idx, ins.pos, &ins.content);
+                    }
+                }
+                PendingOp::Delete(del) => {
+                    if del.len > 0 {
+                        self.rga.delete(del.start, del.len);
+                    }
+                }
             }
         }
     }
@@ -955,7 +981,7 @@ impl RgaBuf {
     /// Insert content at the given position.
     ///
     /// If this insert is adjacent to a pending insert by the same user,
-    /// the content is buffered. Otherwise, the pending insert is flushed
+    /// the content is buffered. Otherwise, the pending operation is flushed
     /// and a new pending insert is started.
     pub fn insert(&mut self, user: &KeyPub, pos: u64, content: &[u8]) {
         if content.is_empty() {
@@ -965,7 +991,7 @@ impl RgaBuf {
         let user_idx = self.rga.ensure_user(user);
 
         // Check if we can extend a pending insert
-        if let Some(ref mut pending) = self.pending {
+        if let Some(PendingOp::Insert(ref mut pending)) = self.pending {
             if pending.user_idx == user_idx
                 && pos == pending.pos + pending.content.len() as u64
             {
@@ -977,24 +1003,26 @@ impl RgaBuf {
 
         // Can't extend - flush any pending operation and start a new one
         self.flush();
-        self.pending = Some(PendingInsert {
+        self.pending = Some(PendingOp::Insert(PendingInsert {
             user_idx,
             pos,
             content: SmallVec::from_slice(content),
-        });
+        }));
     }
 
     /// Delete a range of visible characters.
     ///
-    /// Optimized for backspace at end of pending insert: trim the buffer
-    /// instead of flushing and performing a full delete operation.
+    /// Optimized for:
+    /// - Backspace at end of pending insert: trim the buffer instead of delete
+    /// - Adjacent deletes (backspace pattern): buffer deletes at P, P-1, P-2...
+    /// - Adjacent deletes (forward delete): buffer deletes at P, P, P...
     pub fn delete(&mut self, start: u64, len: u64) {
         if len == 0 {
             return;
         }
 
-        // Check if we can trim a pending insert instead of doing a full delete
-        if let Some(ref mut pending) = self.pending {
+        // Check if we can trim a pending insert
+        if let Some(PendingOp::Insert(ref mut pending)) = self.pending {
             let pending_end = pending.pos + pending.content.len() as u64;
 
             // Backspace at end of pending insert
@@ -1012,9 +1040,30 @@ impl RgaBuf {
             }
         }
 
-        // Can't optimize - flush any pending operation and perform the delete
+        // Check if we can extend a pending delete
+        if let Some(PendingOp::Delete(ref mut pending)) = self.pending {
+            // Backspace pattern: delete at (pending.start - len)
+            // Example: pending is {start: 5, len: 1}, new delete is {start: 4, len: 1}
+            // Result should be {start: 4, len: 2}
+            if start + len == pending.start {
+                pending.start = start;
+                pending.len += len;
+                return;
+            }
+
+            // Forward delete pattern: delete at pending.start (same position)
+            // Example: pending is {start: 5, len: 1}, new delete is {start: 5, len: 1}
+            // After first delete at 5, the next char moves to 5, so we delete at 5 again
+            // Result should be {start: 5, len: 2}
+            if start == pending.start {
+                pending.len += len;
+                return;
+            }
+        }
+
+        // Can't optimize - flush any pending operation and start new delete
         self.flush();
-        self.rga.delete(start, len);
+        self.pending = Some(PendingOp::Delete(PendingDelete { start, len }));
     }
 
     /// Get the visible length (excluding deleted items).
@@ -1643,7 +1692,10 @@ mod rga_buf_tests {
         
         // Should be buffered, not yet in RGA
         assert!(buf.pending.is_some());
-        assert_eq!(buf.pending.as_ref().unwrap().content.as_slice(), b"hello");
+        match buf.pending.as_ref().unwrap() {
+            PendingOp::Insert(ins) => assert_eq!(ins.content.as_slice(), b"hello"),
+            _ => panic!("expected PendingOp::Insert"),
+        }
         
         // Flush and verify
         assert_eq!(buf.to_string(), "hello");
@@ -1700,7 +1752,10 @@ mod rga_buf_tests {
         
         // Pending should still be "hello"
         assert!(buf.pending.is_some());
-        assert_eq!(buf.pending.as_ref().unwrap().content.as_slice(), b"hello");
+        match buf.pending.as_ref().unwrap() {
+            PendingOp::Insert(ins) => assert_eq!(ins.content.as_slice(), b"hello"),
+            _ => panic!("expected PendingOp::Insert"),
+        }
     }
 
     #[test]
