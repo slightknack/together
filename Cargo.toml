@@ -14,6 +14,10 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 proptest = "1.9.0"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+diamond-types = "1"  # Reference implementation for correctness testing
 
 [[bench]]
 name = "version_bench"

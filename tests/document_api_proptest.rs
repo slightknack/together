@@ -164,7 +164,7 @@ proptest! {
         let mut rga = Rga::new();
         
         // Create initial content
-        let initial: Vec<u8> = (0..initial_len as usize).map(|i| (b'a' + (i % 26) as u8)).collect();
+        let initial: Vec<u8> = (0..initial_len as usize).map(|i| b'a' + (i % 26) as u8).collect();
         rga.insert(&user.key_pub, 0, &initial);
         
         let len = rga.len();
@@ -194,7 +194,7 @@ proptest! {
         let mut rga = Rga::new();
         
         // Create initial content
-        let initial: Vec<u8> = (0..initial_len as usize).map(|i| (b'a' + (i % 26) as u8)).collect();
+        let initial: Vec<u8> = (0..initial_len as usize).map(|i| b'a' + (i % 26) as u8).collect();
         rga.insert(&user.key_pub, 0, &initial);
         
         let len = rga.len();
@@ -221,7 +221,7 @@ proptest! {
         let mut rga = Rga::new();
         
         // Create initial content
-        let initial: Vec<u8> = (0..initial_len as usize).map(|i| (b'a' + (i % 26) as u8)).collect();
+        let initial: Vec<u8> = (0..initial_len as usize).map(|i| b'a' + (i % 26) as u8).collect();
         rga.insert(&user.key_pub, 0, &initial);
         
         let len = rga.len();
@@ -265,7 +265,7 @@ proptest! {
         let mut rga = Rga::new();
         
         // Create initial content
-        let initial: Vec<u8> = (0..initial_len as usize).map(|i| (b'a' + (i % 26) as u8)).collect();
+        let initial: Vec<u8> = (0..initial_len as usize).map(|i| b'a' + (i % 26) as u8).collect();
         rga.insert(&user.key_pub, 0, &initial);
         
         let len = rga.len();

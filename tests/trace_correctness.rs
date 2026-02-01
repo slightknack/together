@@ -1,10 +1,13 @@
 // model = "claude-opus-4-5"
-// created = "2026-01-31"
-// modified = "2026-01-31"
+// created = 2026-01-31
+// modified = 2026-01-31
 // driver = "Isaac Clayton"
 
 //! Integration tests verifying Together produces identical output to diamond-types
 //! on all standard editing traces from https://github.com/josephg/editing-traces
+//!
+//! Diamond-types is the reference implementation - if both produce the same output
+//! and it matches the expected endContent, we have high confidence in correctness.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -47,7 +50,7 @@ impl TestData {
             reader.read_to_end(&mut raw_json).expect("failed to read");
         }
 
-        return serde_json::from_slice(&raw_json).expect("failed to parse JSON");
+        serde_json::from_slice(&raw_json).expect("failed to parse JSON")
     }
 }
 
@@ -66,7 +69,7 @@ fn replay_together(data: &TestData) -> String {
         }
     }
 
-    return rga.to_string();
+    rga.to_string()
 }
 
 fn replay_diamond(data: &TestData) -> String {
@@ -86,7 +89,7 @@ fn replay_diamond(data: &TestData) -> String {
         }
     }
 
-    return doc.branch.content().to_string();
+    doc.branch.content().to_string()
 }
 
 #[test]
