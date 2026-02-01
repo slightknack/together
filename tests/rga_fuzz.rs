@@ -256,6 +256,16 @@ proptest! {
         let mut merged_21 = rga2.clone();
         merged_21.merge(&rga1);
         
+        if merged_12.to_string() != merged_21.to_string() {
+            eprintln!("user1: {:?}", &user1.key_pub.0[..4]);
+            eprintln!("user2: {:?}", &user2.key_pub.0[..4]);
+            eprintln!("user1 > user2: {}", user1.key_pub > user2.key_pub);
+            eprintln!("rga1: {:?}", rga1.to_string());
+            eprintln!("rga2: {:?}", rga2.to_string());
+            eprintln!("merge(rga1, rga2): {:?}", merged_12.to_string());
+            eprintln!("merge(rga2, rga1): {:?}", merged_21.to_string());
+        }
+        
         prop_assert_eq!(merged_12.to_string(), merged_21.to_string());
         prop_assert_eq!(merged_12.len(), merged_21.len());
     }
@@ -498,19 +508,29 @@ fn merge_multiple_splits_same_origin() {
     // Multiple items with the same origin, testing subtree skipping
     let (user1, user2) = ordered_users();
     
+    eprintln!("user1: {:?}", &user1.key_pub.0[..4]);
+    eprintln!("user2: {:?}", &user2.key_pub.0[..4]);
+    eprintln!("user1 < user2: {}", user1.key_pub < user2.key_pub);
+    
     let mut rga1 = Rga::new();
     rga1.insert(&user1.key_pub, 0, b"a");
+    eprintln!("rga1: {:?}", rga1.to_string());
     
     let mut rga2 = Rga::new();
     rga2.insert(&user2.key_pub, 0, b"aa");
+    eprintln!("rga2 after 'aa' at 0: {:?}", rga2.to_string());
     rga2.insert(&user2.key_pub, 1, b"aa"); // Insert after first 'a', splits span
+    eprintln!("rga2 after 'aa' at 1: {:?}", rga2.to_string());
     rga2.insert(&user2.key_pub, 2, b"b");  // Insert after second 'a' (which is first of inserted "aa")
+    eprintln!("rga2 after 'b' at 2: {:?}", rga2.to_string());
     
     let mut m1 = rga1.clone();
     m1.merge(&rga2);
+    eprintln!("m1 = merge(rga1, rga2): {:?}", m1.to_string());
     
     let mut m2 = rga2.clone();
     m2.merge(&rga1);
+    eprintln!("m2 = merge(rga2, rga1): {:?}", m2.to_string());
     
     assert_eq!(m1.to_string(), m2.to_string());
 }
@@ -676,12 +696,35 @@ proptest! {
             apply_rga_op(&mut rga2, &user2, op);
         }
         
+        // Debug spans before merge
+        eprintln!("\n=== SPANS BEFORE MERGE ===");
+        eprintln!("rga1 spans: {:?}", rga1.debug_spans());
+        eprintln!("rga2 spans: {:?}", rga2.debug_spans());
+        eprintln!("===========================\n");
+        
         // Merge
+        eprintln!("\n>>> STARTING MERGE m12 (rga1 <- rga2) <<<");
         let mut m12 = rga1.clone();
         m12.merge(&rga2);
+        eprintln!(">>> FINISHED MERGE m12, doc = {:?} <<<\n", m12.to_string());
         
+        eprintln!("\n>>> STARTING MERGE m21 (rga2 <- rga1) <<<");
         let mut m21 = rga2.clone();
         m21.merge(&rga1);
+        eprintln!(">>> FINISHED MERGE m21, doc = {:?} <<<\n", m21.to_string());
+        
+        if m12.to_string() != m21.to_string() {
+            eprintln!("\n=== FAILURE DEBUG ===");
+            eprintln!("user1: {:?}", &user1.key_pub.0[..4]);
+            eprintln!("user2: {:?}", &user2.key_pub.0[..4]);
+            eprintln!("user1 > user2: {}", user1.key_pub > user2.key_pub);
+            eprintln!("base: {:?}", base.to_string());
+            eprintln!("rga1: {:?}", rga1.to_string());
+            eprintln!("rga2: {:?}", rga2.to_string());
+            eprintln!("m12: {:?}", m12.to_string());
+            eprintln!("m21: {:?}", m21.to_string());
+            eprintln!("=== END DEBUG ===\n");
+        }
         
         prop_assert_eq!(m12.to_string(), m21.to_string());
     }

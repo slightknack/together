@@ -186,16 +186,26 @@ impl OriginId {
     }
 }
 
-/// A compact span of consecutive items inserted by the same user (24 bytes).
+/// A compact span of consecutive items inserted by the same user (30 bytes).
+/// 
+/// Stores both left origin and right origin to match Yjs/YATA/Fugue approach.
+/// The dual-origin approach is necessary for correct merge commutativity
+/// because it allows detecting subtree boundaries during merge.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct Span {
     seq: u32,
     len: u32,
-    /// Origin user index (NO_ORIGIN_USER if no origin).
+    /// Left origin user index (NO_ORIGIN_USER if no origin).
+    /// The character this span was inserted AFTER.
     origin_user_idx: u16,
-    /// Origin sequence number.
+    /// Left origin sequence number.
     origin_seq: u32,
+    /// Right origin user index (NO_ORIGIN_USER if no origin).
+    /// The character that was immediately to the RIGHT when this span was inserted.
+    right_origin_user_idx: u16,
+    /// Right origin sequence number.
+    right_origin_seq: u32,
     content_offset: u32,
     user_idx: u16,
     deleted: bool,
@@ -208,6 +218,7 @@ impl Span {
         seq: u32,
         len: u32,
         origin: OriginId,
+        right_origin: OriginId,
         content_offset: u32,
     ) -> Span {
         return Span {
@@ -215,6 +226,8 @@ impl Span {
             len,
             origin_user_idx: origin.user_idx,
             origin_seq: origin.seq,
+            right_origin_user_idx: right_origin.user_idx,
+            right_origin_seq: right_origin.seq,
             content_offset,
             user_idx,
             deleted: false,
@@ -239,6 +252,23 @@ impl Span {
         return self.origin_user_idx != NO_ORIGIN_USER;
     }
 
+    fn right_origin(&self) -> OriginId {
+        return OriginId {
+            user_idx: self.right_origin_user_idx,
+            seq: self.right_origin_seq,
+        };
+    }
+
+    fn set_right_origin(&mut self, right_origin: OriginId) {
+        self.right_origin_user_idx = right_origin.user_idx;
+        self.right_origin_seq = right_origin.seq;
+    }
+
+    #[inline(always)]
+    fn has_right_origin(&self) -> bool {
+        return self.right_origin_user_idx != NO_ORIGIN_USER;
+    }
+
     #[inline(always)]
     fn contains_seq(&self, seq: u32) -> bool {
         return seq >= self.seq && seq < self.seq + self.len;
@@ -246,25 +276,38 @@ impl Span {
 
     /// Split this span at the given offset, returning the right part.
     /// 
-    /// The right part's origin is set to the last character of the left part.
-    /// This is semantically correct because within a span, each character
-    /// (except the first) was conceptually inserted after the previous one.
-    /// When we split, we're exposing this implicit relationship.
+    /// For left origin:
+    /// - The right part's left origin is set to the last character of the left part.
+    ///   This is semantically correct because within a span, each character
+    ///   (except the first) was conceptually inserted after the previous one.
+    /// 
+    /// For right origin:
+    /// - The right part keeps the original right_origin (what was to its right at insertion).
+    /// - The left part ALSO keeps the original right_origin.
+    ///   This is important for YATA ordering: the right_origin captures the insertion
+    ///   context, not the current document structure. Changing it during splits would
+    ///   break merge commutativity.
     #[inline]
     fn split(&mut self, offset: u32) -> Span {
         debug_assert!(offset > 0 && offset < self.len);
-        // The right part's origin is the last character of the left part.
+        // The right part's left origin is the last character of the left part.
         // This is correct because within a span, seq N was inserted after seq N-1.
+        // Both parts keep the original right_origin - it's an insertion-time property.
         let right = Span {
             seq: self.seq + offset,
             len: self.len - offset,
             origin_user_idx: self.user_idx,
             origin_seq: self.seq + offset - 1,
+            // Right part keeps the original right_origin
+            right_origin_user_idx: self.right_origin_user_idx,
+            right_origin_seq: self.right_origin_seq,
             content_offset: self.content_offset + offset,
             user_idx: self.user_idx,
             deleted: self.deleted,
             _padding: 0,
         };
+        // Left part keeps its original right_origin - don't change it!
+        // The right_origin is an insertion-time property, not a document structure property.
         self.len = offset;
         return right;
     }
@@ -344,19 +387,6 @@ impl CursorCache {
         self.chunk_idx = chunk_idx;
         self.idx_in_chunk = idx_in_chunk;
         self.valid = true;
-    }
-
-    /// Adjust the cache after an insert at the given position with the given length.
-    /// The insert position is where the new content starts (before adjustment).
-    /// When a new span is inserted, it can shift span indices and invalidate our cache.
-    fn adjust_after_insert(&mut self, _insert_pos: u64, _insert_len: u64, _new_span_idx: usize) {
-        // When inserting at a position different from where we cached,
-        // the span indices can shift in complex ways. Rather than trying to track
-        // these changes precisely, we simply invalidate the cache.
-        // The next insert will do a fresh lookup and re-establish the cache.
-        // This only affects non-sequential inserts (e.g., insert at beginning after
-        // typing at the end), which are relatively rare.
-        self.invalidate();
     }
 
     /// Adjust the cache after a delete starting at the given position with the given length.
@@ -486,12 +516,13 @@ impl Rga {
         column.content.extend_from_slice(content);
         column.next_seq += content.len() as u32;
 
-        // Create the span (origin is set during insert_span_at_pos_optimized)
+        // Create the span (origin and right_origin are set during insert_span_at_pos_optimized)
         let span = Span::new(
             user_idx,
             seq,
             content.len() as u32,
             OriginId::none(),
+            OriginId::none(), // Will be set properly in Part 2
             content_offset,
         );
 
@@ -864,19 +895,22 @@ impl Rga {
     /// Attempts to coalesce with the preceding span if possible.
     /// Uses cursor caching for O(1) sequential typing with chunk location caching.
     #[inline]
-    fn insert_span_at_pos_optimized(&mut self, mut span: Span, pos: u64) {
+    fn insert_span_at_pos_optimized(&mut self, span: Span, pos: u64) {
         let span_len = span.visible_len() as u64;
+        let doc_len = self.spans.total_weight();
 
         if self.spans.is_empty() {
             // No origin for first span - use RGA ordering (no-op for empty doc)
-            self.insert_span_rga(span, None);
+            self.insert_span_rga(span, None, None);
             self.cursor_cache.update(pos + span_len - 1, 0, span_len - 1, 0, 0);
             return;
         }
 
         if pos == 0 {
-            // No origin when inserting at beginning - use RGA ordering for root-level spans
-            self.insert_span_rga(span, None);
+            // No left_origin when inserting at beginning
+            // right_origin is the first visible character (what will be pushed right)
+            let right_origin = self.find_first_visible_item_id();
+            self.insert_span_rga(span, None, right_origin);
             self.cursor_cache.invalidate();
             return;
         }
@@ -933,7 +967,7 @@ impl Rga {
                     match self.spans.find_by_weight_with_chunk(lookup_pos) {
                         Some((span_idx, off, c_idx, i_in_c)) => (span_idx, off, c_idx, i_in_c),
                         None => {
-                            self.insert_span_rga(span, None);
+                            self.insert_span_rga(span, None, None);
                             self.cursor_cache.invalidate();
                             return;
                         }
@@ -943,7 +977,7 @@ impl Rga {
                     match self.spans.find_by_weight_with_chunk(lookup_pos) {
                         Some((span_idx, off, c_idx, i_in_c)) => (span_idx, off, c_idx, i_in_c),
                         None => {
-                            self.insert_span_rga(span, None);
+                            self.insert_span_rga(span, None, None);
                             self.cursor_cache.invalidate();
                             return;
                         }
@@ -956,7 +990,7 @@ impl Rga {
                 Some((span_idx, off, c_idx, i_in_c)) => (span_idx, off, c_idx, i_in_c),
                 None => {
                     // pos >= total_weight + 1, insert at end (shouldn't normally happen)
-                    self.insert_span_rga(span, None);
+                    self.insert_span_rga(span, None, None);
                     self.cursor_cache.invalidate();
                     return;
                 }
@@ -967,12 +1001,20 @@ impl Rga {
         let prev_span = self.spans.get_with_chunk_hint(chunk_idx, idx_in_chunk).unwrap();
         let prev_visible_len = prev_span.visible_len() as u64;
         
-        // Build the origin ItemId for the character we're inserting after
+        // Build the left_origin ItemId for the character we're inserting after
         let origin_user = *self.users.get_key(prev_span.user_idx).unwrap();
         let origin_seq = prev_span.seq + offset_in_prev as u32;
-        let origin_id = ItemId {
+        let left_origin_id = ItemId {
             user: origin_user,
             seq: origin_seq as u64,
+        };
+
+        // Build the right_origin ItemId: the character at position `pos` (what will be pushed right)
+        // If pos == doc_len, there's nothing to the right, so right_origin is None
+        let right_origin_id = if pos < doc_len {
+            self.find_item_id_at_visible_pos(pos)
+        } else {
+            None
         };
 
         // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted
@@ -1011,8 +1053,35 @@ impl Rga {
 
         // Can't coalesce - use RGA ordering to find correct position among siblings
         // This ensures merge commutativity even when local inserts create siblings
-        self.insert_span_rga(span, Some(origin_id));
+        self.insert_span_rga(span, Some(left_origin_id), right_origin_id);
         self.cursor_cache.invalidate();
+    }
+
+    /// Find the ItemId of the first visible character in the document.
+    /// Returns None if the document has no visible characters.
+    fn find_first_visible_item_id(&self) -> Option<ItemId> {
+        for span in self.spans.iter() {
+            if !span.deleted && span.len > 0 {
+                let user = *self.users.get_key(span.user_idx)?;
+                return Some(ItemId {
+                    user,
+                    seq: span.seq as u64,
+                });
+            }
+        }
+        None
+    }
+
+    /// Find the ItemId of the character at the given visible position.
+    /// Returns None if position is out of bounds.
+    fn find_item_id_at_visible_pos(&self, pos: u64) -> Option<ItemId> {
+        let (span_idx, offset_in_span) = self.spans.find_by_weight(pos)?;
+        let span = self.spans.get(span_idx)?;
+        let user = *self.users.get_key(span.user_idx)?;
+        Some(ItemId {
+            user,
+            seq: (span.seq + offset_in_span as u32) as u64,
+        })
     }
 
     /// Find span containing the given ItemId using linear search.
@@ -1057,7 +1126,7 @@ impl Rga {
     /// Returns true if the operation was applied, false if it was already present.
     pub fn apply(&mut self, user: &KeyPub, block: &OpBlock) -> bool {
         match &block.op {
-            Op::Insert { origin, seq, len } => {
+            Op::Insert { origin, right_origin, seq, len } => {
                 let user_idx = self.ensure_user(user);
                 let column = &self.columns[user_idx as usize];
                 
@@ -1082,10 +1151,14 @@ impl Rga {
                     *seq as u32,
                     *len as u32,
                     OriginId::none(), // Will be set during insert_span_rga
+                    OriginId::none(), // Will be set during insert_span_rga
                     content_offset,
                 );
 
-                self.insert_span_rga(span, origin.as_ref().map(Self::convert_id));
+                // Pass both origins to the YATA/FugueMax algorithm
+                let left_origin_id = origin.as_ref().map(Self::convert_id);
+                let right_origin_id = right_origin.as_ref().map(Self::convert_id);
+                self.insert_span_rga(span, left_origin_id, right_origin_id);
                 return true;
             }
             Op::Delete { target } => {
@@ -1095,148 +1168,354 @@ impl Rga {
         }
     }
 
-    /// Insert a span using RGA ordering rules.
+    /// Skip over a span and its entire subtree.
     /// 
-    /// The origin is specified as an ItemId (user, seq) which uniquely identifies
-    /// the character this span was inserted after. This is invariant across
-    /// different document structures, ensuring merge commutativity.
+    /// In RGA, spans form a tree where each span's children are spans whose origin
+    /// points to a character within that span. In document order, a span's subtree
+    /// immediately follows it.
     /// 
-    /// When multiple spans have the same origin, they are ordered by (user, seq) descending.
-    fn insert_span_rga(&mut self, mut span: Span, origin: Option<ItemId>) {
+    /// Given a span at position `start_pos`, this returns the position after the
+    /// span and all its descendants.
+    fn skip_subtree(&self, start_pos: usize) -> usize {
+        if start_pos >= self.spans.len() {
+            return start_pos;
+        }
+        
+        let start_span = self.spans.get(start_pos).unwrap();
+        let start_user_idx = start_span.user_idx;
+        let start_seq = start_span.seq;
+        let start_end_seq = start_span.seq + start_span.len - 1;
+        
+        let mut pos = start_pos + 1;
+        
+        // Skip all spans that are descendants of start_span.
+        // A span is a descendant if its origin chain leads back to start_span.
+        // 
+        // We use a simplified check: a span is in our subtree if its origin
+        // is within start_span OR if its origin is in a span we've already
+        // determined to be in our subtree.
+        // 
+        // To avoid recursion, we track the "frontier" - the rightmost seq we've
+        // seen from any span in the subtree. Any span whose origin is <= this
+        // frontier (for the same user) could be in the subtree.
+        //
+        // Actually, for correctness we need to track which (user, seq) ranges
+        // are part of the subtree. This is complex, so we use a simpler approach:
+        // scan forward and check if each span's origin is within any span we've
+        // already included in the subtree.
+        
+        // Track all (user_idx, seq_start, seq_end) ranges in the subtree
+        let mut subtree_ranges: Vec<(u16, u32, u32)> = vec![(start_user_idx, start_seq, start_end_seq)];
+        
+        while pos < self.spans.len() {
+            let other = self.spans.get(pos).unwrap();
+            
+            // If this span has no origin, it's at the root level - not a descendant
+            if !other.has_origin() {
+                break;
+            }
+            
+            let other_origin = other.origin();
+            
+            // Check if this span's origin is within any span in our subtree
+            let is_descendant = subtree_ranges.iter().any(|&(user_idx, seq_start, seq_end)| {
+                other_origin.user_idx == user_idx 
+                    && other_origin.seq >= seq_start 
+                    && other_origin.seq <= seq_end
+            });
+            
+            if is_descendant {
+                // Add this span's range to the subtree
+                subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
+                pos += 1;
+            } else {
+                // Not a descendant - we've exited the subtree
+                break;
+            }
+        }
+        
+        pos
+    }
+
+    /// Insert a span using YATA/FugueMax ordering rules with dual origins.
+    /// 
+    /// The left_origin is the character this span was inserted AFTER.
+    /// The right_origin is the character that was immediately to the RIGHT when inserted.
+    /// 
+    /// The YATA/FugueMax algorithm uses both origins to achieve correct merge commutativity:
+    /// 1. Find position of left origin (L)
+    /// 2. Scan right from L, comparing with each existing item O
+    /// 3. For each O with same left origin as us (siblings):
+    ///    - If O.right_origin != our right_origin: use right origin as tiebreaker
+    ///    - If right origins match: use (user, seq) descending as tiebreaker
+    /// 4. Stop when we exit the subtree (O.left_origin != L)
+    /// 5. When skipping a sibling, skip its entire subtree
+    fn insert_span_rga(&mut self, mut span: Span, left_origin: Option<ItemId>, right_origin: Option<ItemId>) {
         let span_len = span.visible_len() as u64;
 
         if self.spans.is_empty() {
+            // Set origins on span even for first insert
+            if let Some(ref ro) = right_origin {
+                let ro_user_idx = self.ensure_user(&ro.user);
+                span.set_right_origin(OriginId::some(ro_user_idx, ro.seq as u32));
+            }
             self.spans.insert(0, span, span_len);
             return;
         }
 
-        let insert_idx = if let Some(ref origin_id) = origin {
-            // Set the origin on the span using the item ID
+        let insert_idx = if let Some(ref origin_id) = left_origin {
+            // Set the left origin on the span
             let origin_user_idx = self.ensure_user(&origin_id.user);
             span.set_origin(OriginId::some(origin_user_idx, origin_id.seq as u32));
             
-            // Find the origin span
+            // Set the right origin if present
+            if let Some(ref ro) = right_origin {
+                let ro_user_idx = self.ensure_user(&ro.user);
+                span.set_right_origin(OriginId::some(ro_user_idx, ro.seq as u32));
+            }
+            
+            // Find the left origin span
             if let Some(origin_idx) = self.find_span_by_id(origin_id) {
                 let origin_span = self.spans.get(origin_idx).unwrap();
                 let offset_in_span = (origin_id.seq as u32) - origin_span.seq;
 
                 // If origin is in the middle of a span, split it
-                // Note: after split, origin_idx still points to the left part (which contains our origin char)
                 if offset_in_span < origin_span.len - 1 {
                     let mut existing = self.spans.remove(origin_idx);
-                    // split() sets the right part's origin correctly using item IDs
                     let right = existing.split(offset_in_span + 1);
                     self.spans.insert(origin_idx, existing, existing.visible_len() as u64);
                     self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
                 }
 
-                // Insert after origin, respecting RGA ordering.
-                // Start after the origin span.
-                let mut pos = origin_idx + 1;
-                let span_user = self.users.get_key(span.user_idx).unwrap();
+                // YATA/FugueMax algorithm:
+                // Scan right from left origin, comparing only with siblings.
+                // Skip over non-siblings (descendants of siblings).
+                // Stop when we find a sibling we should come before.
+                //
+                // Key insight: we ONLY compare with siblings that share our exact left origin.
+                // Non-siblings are either descendants (skip them) or from different branches (stop).
+                //
+                // To track the subtree boundary, we maintain a set of (user, seq) ranges
+                // that are part of the subtree rooted at our origin. A span is in the
+                // subtree if its origin is within any of these ranges.
                 
-                // For RGA: concurrent inserts at the same origin are ordered by (user, seq) descending.
-                // 
-                // ULTRA-CONSERVATIVE algorithm: only skip siblings that we KNOW have higher
-                // precedence, and their DIRECT children only. Stop at anything else.
-                // This may not be optimal but should be correct.
+                let mut pos = origin_idx + 1;
+                
+                // Track all (user_idx, seq_start, seq_end) ranges in the subtree of our origin
+                // Initially contains just the origin itself
+                let origin_user_idx = self.ensure_user(&origin_id.user);
+                let mut subtree_ranges: Vec<(u16, u32, u32)> = vec![
+                    (origin_user_idx, origin_id.seq as u32, origin_id.seq as u32)
+                ];
+                
+                // Get span info after ensure_user to avoid borrow conflicts
+                let span_user = *self.users.get_key(span.user_idx).unwrap();
+                let span_right_origin = span.right_origin();
+                
+                // NOTE: We do NOT use right_origin position as a boundary.
+                // The YATA/FugueMax algorithm compares right_origins as IDs, not positions.
+                // Using position would break commutativity because positions differ between replicas.
                 
                 while pos < self.spans.len() {
                     let other = self.spans.get(pos).unwrap();
                     
+                    // Check if this span is a sibling (same left origin as us)
                     if !other.has_origin() {
-                        // No-origin span - definitely outside our origin's subtree
+                        // No-origin span - different branch, stop here
                         break;
                     }
                     
                     let other_origin = other.origin();
                     let other_origin_user = match self.users.get_key(other_origin.user_idx) {
                         Some(u) => *u,
-                        None => { pos += 1; continue; }
+                        None => break,
                     };
                     
-                    // Check if this span has the same origin as us (it's a sibling)
                     let is_sibling = other_origin_user == origin_id.user 
                         && other_origin.seq as u64 == origin_id.seq;
                     
-                    if is_sibling {
-                        // Compare precedence with sibling
-                        let other_user = self.users.get_key(other.user_idx).unwrap();
-                        if (other_user, other.seq) > (span_user, span.seq) {
-                            // This sibling has higher precedence; we need to go after it
-                            // But we also need to skip its subtree.
-                            // For safety, just move past this one span and check again.
-                            pos += 1;
-                            continue;
-                        }
-                        // Same origin but lower/equal precedence - insert before this span
-                        break;
-                    }
-                    
-                    // Not a sibling. Check if this span's origin is "deeper" in the tree
-                    // than our origin. If so, it might be in a sibling's subtree - skip.
-                    // If not, we've exited our origin's subtree.
-                    //
-                    // A span is "deeper" if its origin seq > our origin seq (same user).
-                    // Cross-user origins are tricky - be conservative and stop.
-                    if other_origin_user == origin_id.user {
-                        if (other_origin.seq as u64) > origin_id.seq {
-                            // Origin is deeper - this is a descendant, skip it
+                    if !is_sibling {
+                        // Not a sibling. Check if this span's origin is within our subtree.
+                        // If so, it's a descendant of some sibling - add it to subtree and continue.
+                        // If not, we've exited the subtree - stop here.
+                        let is_in_subtree = subtree_ranges.iter().any(|&(user_idx, seq_start, seq_end)| {
+                            other_origin.user_idx == user_idx 
+                                && other_origin.seq >= seq_start 
+                                && other_origin.seq <= seq_end
+                        });
+                        
+                        if is_in_subtree {
+                            // Add this span to the subtree
+                            subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
                             pos += 1;
                             continue;
                         } else {
-                            // Origin is at or before ours - we've exited
+                            // Not in subtree - we've exited, stop here
                             break;
                         }
                     }
                     
-                    // Different user origin - be conservative and stop
-                    // This may not be optimal but should be correct
+                    // This is a sibling - compare using YATA rules:
+                    // 1. Compare right origins
+                    // 2. If equal, compare (user, seq)
+                    
+                    let other_right_origin = other.right_origin();
+                    
+                    // Right origin comparison
+                    // YATA/Yjs semantics: null rightOrigin = "inserted at end" = infinite position
+                    // Items with non-null rightOrigin come BEFORE items with null rightOrigin
+                    if other.has_right_origin() != span.has_right_origin() {
+                        if !other.has_right_origin() && span.has_right_origin() {
+                            // Other has no right origin (inserted at end = infinite)
+                            // We have a right origin (finite position)
+                            // Finite < infinite, so we come BEFORE other -> insert here
+                            break;
+                        } else {
+                            // We have no right origin (inserted at end = infinite)
+                            // Other has a right origin (finite position)
+                            // Finite < infinite, so other comes BEFORE us -> skip other, continue
+                            subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
+                            pos = self.skip_subtree(pos);
+                            continue;
+                        }
+                    }
+                    
+                    if other.has_right_origin() && span.has_right_origin() {
+                        let other_ro_user = match self.users.get_key(other_right_origin.user_idx) {
+                            Some(u) => *u,
+                            None => { 
+                                subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
+                                pos = self.skip_subtree(pos); 
+                                continue; 
+                            }
+                        };
+                        let span_ro_user = match self.users.get_key(span_right_origin.user_idx) {
+                            Some(u) => *u,
+                            None => break,
+                        };
+                        
+                        // YATA rule: Higher right origin = inserted later with more context
+                        // = should come FIRST in the document
+                        let other_ro_key = (other_ro_user, other_right_origin.seq);
+                        let span_ro_key = (span_ro_user, span_right_origin.seq);
+                        
+                        if other_ro_key > span_ro_key {
+                            // Other's right origin is higher - other was inserted later, comes first
+                            // Add to subtree and skip
+                            subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
+                            pos = self.skip_subtree(pos);
+                            continue;
+                        } else if other_ro_key < span_ro_key {
+                            // Our right origin is higher - we were inserted later, come first
+                            break;
+                        }
+                    }
+                    
+                    // Right origins are equal - use (user, seq) as tiebreaker
+                    // Higher (user, seq) = earlier in document
+                    let other_user = *self.users.get_key(other.user_idx).unwrap();
+                    if (other_user, other.seq) > (span_user, span.seq) {
+                        // Other has higher precedence - add to subtree and skip
+                        subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
+                        pos = self.skip_subtree(pos);
+                        continue;
+                    }
+                    // We have higher or equal precedence - insert here
                     break;
                 }
                 pos
             } else {
-                // Origin not found - insert at end (this shouldn't normally happen in a valid merge)
+                // Left origin not found - insert at end
                 self.spans.len()
             }
         } else {
-            // No origin - this span is at the root level.
-            // We need to find the correct position among other root-level spans,
-            // ordered by (user, seq) descending. Root-level spans are those with no origin.
-            // 
-            // The tricky part: in document order, a root-level span's descendants
-            // (spans with origins tracing back to it) appear right after it.
-            // So we need to skip past not just the root span but also its entire subtree.
-            //
-            // Algorithm:
-            // 1. Scan through all spans
-            // 2. When we see a no-origin span with higher (user, seq), skip it AND its subtree
-            // 3. The subtree ends at the next no-origin span (or end of document)
+            // No left origin - this span is at the root level (inserted at position 0)
+            // Set right origin if present
+            if let Some(ref ro) = right_origin {
+                let ro_user_idx = self.ensure_user(&ro.user);
+                span.set_right_origin(OriginId::some(ro_user_idx, ro.seq as u32));
+            }
+            
+            // YATA/FugueMax for root-level spans:
+            // All no-origin spans are siblings at the root.
+            // Spans with origins are descendants of root spans - skip them.
             let mut pos = 0;
-            let span_user = self.users.get_key(span.user_idx).unwrap();
+            let span_user = *self.users.get_key(span.user_idx).unwrap();
+            let span_right_origin = span.right_origin();
+            
+            // NOTE: We do NOT use right_origin position as a boundary.
+            // The YATA/FugueMax algorithm compares right_origins as IDs, not positions.
+            // Using position would break commutativity because positions differ between replicas.
             
             while pos < self.spans.len() {
                 let other = self.spans.get(pos).unwrap();
-                if !other.has_origin() {
-                    let other_user = self.users.get_key(other.user_idx).unwrap();
-                    if (other_user, other.seq) > (span_user, span.seq) {
-                        // This no-origin span has higher precedence; skip it and its subtree.
-                        // The subtree ends at the next no-origin span.
-                        pos += 1;
-                        while pos < self.spans.len() {
-                            let next = self.spans.get(pos).unwrap();
-                            if !next.has_origin() {
-                                // Found the next root-level span; stop skipping
-                                break;
-                            }
-                            pos += 1;
-                        }
+                
+                if other.has_origin() {
+                    // This span has an origin - it's a descendant of some root span
+                    // Skip it (but not its subtree, since we're iterating and will
+                    // naturally skip descendants)
+                    pos += 1;
+                    continue;
+                }
+                
+                // Another root-level span (no origin) - this is a sibling
+                let other_right_origin = other.right_origin();
+                
+                // Compare right origins first
+                // YATA/Yjs semantics: null rightOrigin = "inserted at end" = infinite position
+                // Items with non-null rightOrigin come BEFORE items with null rightOrigin
+                if other.has_right_origin() != span.has_right_origin() {
+                    if !other.has_right_origin() && span.has_right_origin() {
+                        // Other has no right origin (inserted at end = infinite)
+                        // We have a right origin (finite position)
+                        // Finite < infinite, so we come BEFORE other -> insert here
+                        break;
+                    } else {
+                        // We have no right origin (inserted at end = infinite)
+                        // Other has a right origin (finite position)
+                        // Finite < infinite, so other comes BEFORE us -> skip other, continue
+                        pos = self.skip_subtree(pos);
                         continue;
                     }
                 }
-                // Either:
-                // - This is a no-origin span with lower/equal precedence (insert before it)
-                // - This is an origin span (we shouldn't be here if we skipped subtrees correctly)
+                
+                if other.has_right_origin() && span.has_right_origin() {
+                    let other_ro_user = match self.users.get_key(other_right_origin.user_idx) {
+                        Some(u) => *u,
+                        None => { 
+                            pos = self.skip_subtree(pos); 
+                            continue; 
+                        }
+                    };
+                    let span_ro_user = match self.users.get_key(span_right_origin.user_idx) {
+                        Some(u) => *u,
+                        None => {
+                            break;
+                        }
+                    };
+                    
+                    let other_ro_key = (other_ro_user, other_right_origin.seq);
+                    let span_ro_key = (span_ro_user, span_right_origin.seq);
+                    
+                    if other_ro_key > span_ro_key {
+                        // Other's right origin is higher - other was inserted later, comes first
+                        // Skip other AND its subtree
+                        pos = self.skip_subtree(pos);
+                        continue;
+                    } else if other_ro_key < span_ro_key {
+                        // Our right origin is higher - we were inserted later, come first
+                        break;
+                    }
+                }
+                
+                // Right origins equal - use (user, seq) as tiebreaker
+                let other_user = *self.users.get_key(other.user_idx).unwrap();
+                if (other_user, other.seq) > (span_user, span.seq) {
+                    // Other has higher precedence - skip it AND its subtree
+                    pos = self.skip_subtree(pos);
+                    continue;
+                }
+                // We have higher or equal precedence - insert before
                 break;
             }
             pos
@@ -1519,28 +1798,52 @@ impl Default for RgaBuf {
 impl super::Crdt for Rga {
     fn merge(&mut self, other: &Self) {
         // Merge spans from other into self.
-        // We iterate spans and use their explicit origins when present.
-        // For spans without explicit origin (inserted at beginning), we rely on
-        // RGA ordering by (user, seq) to achieve deterministic placement.
+        // 
+        // IMPORTANT: We must process spans in topological (causal) order.
+        // The YATA algorithm requires that when we insert a span, its left_origin
+        // already exists in the document. If we iterate in document order, a span's
+        // origin might refer to a span that hasn't been inserted yet.
+        //
+        // Solution: Collect all new spans, then repeatedly scan and insert any
+        // span whose origin either:
+        // - Is None (no origin, inserted at beginning)
+        // - Already exists in self (pre-existing or just inserted)
+        
+        // First pass: collect spans that need to be inserted and handle deletions
+        // for spans that already exist.
+        struct PendingSpan {
+            span: Span,
+            left_origin: Option<ItemId>,
+            right_origin: Option<ItemId>,
+        }
+        
+        let mut pending: Vec<PendingSpan> = Vec::new();
         
         for span in other.spans.iter() {
             // Get the user's KeyPub from other's UserTable
             let other_user = other.users.get_key(span.user_idx).unwrap();
             
-            // Check if we already have items from this span.
-            // The source span covers seq..seq+len, but in our document these items
-            // may be split across multiple spans due to inserts in the middle.
-            let first_id = ItemId {
-                user: *other_user,
-                seq: span.seq as u64,
-            };
-            if self.find_span_by_id(&first_id).is_some() {
-                // Items already exist. If the source has them deleted, we need to
-                // propagate that deletion to all items in the range.
-                // Deletions are monotonic: once deleted, always deleted.
+            // Check which items from this span we already have.
+            // Spans can be extended by coalescing, so we need to find the first
+            // item that doesn't exist in self and insert from there.
+            
+            // Find the first seq in this span that doesn't exist in self
+            let mut first_missing_offset: Option<u32> = None;
+            for offset in 0..span.len {
+                let item_id = ItemId {
+                    user: *other_user,
+                    seq: (span.seq + offset) as u64,
+                };
+                if self.find_span_by_id(&item_id).is_none() {
+                    first_missing_offset = Some(offset);
+                    break;
+                }
+            }
+            
+            // If all items exist, handle deletions and skip
+            if first_missing_offset.is_none() {
+                // Items already exist. Propagate deletions if needed.
                 if span.deleted {
-                    // Mark all items in the range seq..seq+len as deleted.
-                    // These may be spread across multiple spans in our document.
                     let user_idx = self.ensure_user(other_user);
                     for seq in span.seq..(span.seq + span.len) {
                         let item_id = ItemId {
@@ -1550,28 +1853,23 @@ impl super::Crdt for Rga {
                         if let Some(idx) = self.find_span_by_id(&item_id) {
                             let existing = self.spans.get(idx).unwrap();
                             if !existing.deleted && existing.user_idx == user_idx {
-                                // Check if this span contains exactly this seq or needs splitting
                                 let offset = seq - existing.seq;
                                 if existing.len == 1 {
-                                    // Single-item span, just mark deleted
                                     self.spans.get_mut(idx).unwrap().deleted = true;
                                     self.spans.update_weight(idx, 0);
                                 } else if offset == 0 && existing.len > 1 {
-                                    // Delete first item: split and mark first as deleted
                                     let mut existing = self.spans.remove(idx);
                                     let right = existing.split(1);
                                     existing.deleted = true;
                                     self.spans.insert(idx, existing, 0);
                                     self.spans.insert(idx + 1, right, right.visible_len() as u64);
                                 } else if offset == existing.len - 1 {
-                                    // Delete last item: split and mark last as deleted
                                     let mut existing = self.spans.remove(idx);
                                     let mut right = existing.split(offset);
                                     right.deleted = true;
                                     self.spans.insert(idx, existing, existing.visible_len() as u64);
                                     self.spans.insert(idx + 1, right, 0);
                                 } else {
-                                    // Delete middle item: split twice
                                     let mut existing = self.spans.remove(idx);
                                     let mut mid_right = existing.split(offset);
                                     let right = mid_right.split(1);
@@ -1587,13 +1885,64 @@ impl super::Crdt for Rga {
                 continue;
             }
 
+            // Some items are missing - we need to insert the missing portion.
+            // first_missing_offset tells us where the missing items start.
+            let missing_offset = first_missing_offset.unwrap();
+            let missing_seq = span.seq + missing_offset;
+            let missing_len = span.len - missing_offset;
+
+            // If the source span is deleted and some items already exist in self,
+            // we need to propagate the deletion for those existing items.
+            // This handles the case where the source has a coalesced deleted span
+            // but the dest only has part of it (the existing part should be deleted).
+            if span.deleted && missing_offset > 0 {
+                let user_idx = self.ensure_user(other_user);
+                for offset in 0..missing_offset {
+                    let seq = span.seq + offset;
+                    let item_id = ItemId {
+                        user: *other_user,
+                        seq: seq as u64,
+                    };
+                    if let Some(idx) = self.find_span_by_id(&item_id) {
+                        let existing = self.spans.get(idx).unwrap();
+                        if !existing.deleted && existing.user_idx == user_idx {
+                            let offset_in_existing = seq - existing.seq;
+                            if existing.len == 1 {
+                                self.spans.get_mut(idx).unwrap().deleted = true;
+                                self.spans.update_weight(idx, 0);
+                            } else if offset_in_existing == 0 && existing.len > 1 {
+                                let mut existing = self.spans.remove(idx);
+                                let right = existing.split(1);
+                                existing.deleted = true;
+                                self.spans.insert(idx, existing, 0);
+                                self.spans.insert(idx + 1, right, right.visible_len() as u64);
+                            } else if offset_in_existing == existing.len - 1 {
+                                let mut existing = self.spans.remove(idx);
+                                let mut right = existing.split(offset_in_existing);
+                                right.deleted = true;
+                                self.spans.insert(idx, existing, existing.visible_len() as u64);
+                                self.spans.insert(idx + 1, right, 0);
+                            } else {
+                                let mut existing = self.spans.remove(idx);
+                                let mut mid_right = existing.split(offset_in_existing);
+                                let right = mid_right.split(1);
+                                mid_right.deleted = true;
+                                self.spans.insert(idx, existing, existing.visible_len() as u64);
+                                self.spans.insert(idx + 1, mid_right, 0);
+                                self.spans.insert(idx + 2, right, right.visible_len() as u64);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Get or create the user index in our table
             let user_idx = self.ensure_user(other_user);
             
-            // Copy content from other's column to our column
+            // Copy only the missing content from other's column to our column
             let other_column = &other.columns[span.user_idx as usize];
             let content = &other_column.content
-                [span.content_offset as usize..(span.content_offset + span.len) as usize];
+                [(span.content_offset + missing_offset) as usize..(span.content_offset + span.len) as usize];
             
             let our_column = &mut self.columns[user_idx as usize];
             let content_offset = our_column.content.len() as u32;
@@ -1605,10 +1954,16 @@ impl super::Crdt for Rga {
                 our_column.next_seq = span_end_seq;
             }
 
-            // Determine the origin for this span.
-            // Since origins are now stored as item IDs (user_idx, seq), we can
-            // directly translate them to ItemId by looking up the user's KeyPub.
-            let origin = if span.has_origin() {
+            // Determine origins for the missing portion.
+            // The left_origin of the missing portion is the last existing item (seq before missing_seq).
+            let left_origin = if missing_offset > 0 {
+                // The item just before the missing portion exists in self
+                Some(ItemId {
+                    user: *other_user,
+                    seq: (missing_seq - 1) as u64,
+                })
+            } else if span.has_origin() {
+                // Use the span's original left origin
                 let origin_id = span.origin();
                 let origin_user = other.users.get_key(origin_id.user_idx).unwrap();
                 Some(ItemId {
@@ -1616,27 +1971,81 @@ impl super::Crdt for Rga {
                     seq: origin_id.seq as u64,
                 })
             } else {
-                // No explicit origin - this span was inserted at the document beginning.
-                // It will be RGA-ordered with other no-origin spans.
                 None
             };
 
-            // Create a new span with our user_idx and content_offset
-            // If the span was deleted in other, create it as already deleted
+            // Right origin: use the span's original right_origin for ALL items.
+            // When items are coalesced, they share the same insertion context.
+            // If user types "hello" coalesced into one span with right_origin=X,
+            // then ALL of "hello" was inserted with X to the right. If we later
+            // merge just "llo" (because "he" already exists), that "llo" should
+            // still have right_origin=X.
+            let right_origin = if span.has_right_origin() {
+                let ro_id = span.right_origin();
+                let ro_user = other.users.get_key(ro_id.user_idx).unwrap();
+                Some(ItemId {
+                    user: *ro_user,
+                    seq: ro_id.seq as u64,
+                })
+            } else {
+                None
+            };
+
+            // Create a new span for just the missing items
             let mut new_span = Span::new(
                 user_idx,
-                span.seq,
-                span.len,
-                OriginId::none(), // Will be set during insert_span_rga
+                missing_seq,
+                missing_len,
+                OriginId::none(),
+                OriginId::none(),
                 content_offset,
             );
-            
-            // Copy the deleted status from the source span
             new_span.deleted = span.deleted;
-
-            // Insert using RGA ordering rules (bypasses apply's sequence check)
-            // The weight is 0 if deleted, otherwise the visible length
-            self.insert_span_rga(new_span, origin);
+            
+            pending.push(PendingSpan {
+                span: new_span,
+                left_origin,
+                right_origin,
+            });
+        }
+        
+        // Second pass: insert spans in topological order.
+        // Repeatedly scan pending, inserting any span whose left_origin exists.
+        // This is O(n^2) in the worst case but simple and correct.
+        // 
+        // IMPORTANT: We use remove(i) instead of swap_remove(i) to preserve
+        // the relative order of spans. This ensures that spans from the same
+        // document maintain their document order when inserted.
+        while !pending.is_empty() {
+            let mut made_progress = false;
+            
+            let mut i = 0;
+            while i < pending.len() {
+                let can_insert = {
+                    let p = &pending[i];
+                    match &p.left_origin {
+                        None => true, // No origin - can always insert
+                        Some(origin_id) => {
+                            // Check if origin exists in self
+                            self.find_span_by_id(origin_id).is_some()
+                        }
+                    }
+                };
+                
+                if can_insert {
+                    let p = pending.remove(i);
+                    self.insert_span_rga(p.span, p.left_origin, p.right_origin);
+                    made_progress = true;
+                    // Don't increment i since remove shifted elements down
+                } else {
+                    i += 1;
+                }
+            }
+            
+            if !made_progress && !pending.is_empty() {
+                // This shouldn't happen if the data is valid (no cycles in origin chains)
+                panic!("merge: circular dependency in origin chains");
+            }
         }
         
         // Invalidate cursor cache since we modified the structure
@@ -1652,10 +2061,20 @@ mod tests {
     #[test]
     fn span_size() {
         // Verify our span is compact
+        // With dual origins (left + right), span is 30 bytes:
+        // - seq: u32 (4)
+        // - len: u32 (4)
+        // - origin_user_idx: u16 (2)
+        // - origin_seq: u32 (4)
+        // - right_origin_user_idx: u16 (2)
+        // - right_origin_seq: u32 (4)
+        // - content_offset: u32 (4)
+        // - user_idx: u16 (2)
+        // - deleted: bool (1)
+        // - _padding: u8 (1)
+        // Total: 28 bytes, but with alignment may be 32
         let size = std::mem::size_of::<Span>();
         assert!(size <= 32, "Span is {} bytes, expected <= 32", size);
-        // Ideally 24 bytes
-        assert_eq!(size, 24, "Span should be exactly 24 bytes");
     }
 
     #[test]
@@ -1782,7 +2201,7 @@ mod tests {
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
 
-        let block = OpBlock::insert(None, 0, b"hello".to_vec());
+        let block = OpBlock::insert(None, None, 0, b"hello".to_vec());
         let applied = rga.apply(&pair.key_pub, &block);
 
         assert!(applied);
@@ -1794,14 +2213,14 @@ mod tests {
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
 
-        let block1 = OpBlock::insert(None, 0, b"hello".to_vec());
+        let block1 = OpBlock::insert(None, None, 0, b"hello".to_vec());
         rga.apply(&pair.key_pub, &block1);
 
         let origin = OpItemId {
             user: pair.key_pub,
             seq: 4,
         };
-        let block2 = OpBlock::insert(Some(origin), 5, b" world".to_vec());
+        let block2 = OpBlock::insert(Some(origin), None, 5, b" world".to_vec());
         rga.apply(&pair.key_pub, &block2);
 
         assert_eq!(rga.to_string(), "hello world");
@@ -1812,7 +2231,7 @@ mod tests {
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
 
-        let block = OpBlock::insert(None, 0, b"hello".to_vec());
+        let block = OpBlock::insert(None, None, 0, b"hello".to_vec());
 
         assert!(rga.apply(&pair.key_pub, &block));
         assert!(!rga.apply(&pair.key_pub, &block));
@@ -1825,7 +2244,7 @@ mod tests {
         let pair = KeyPair::generate();
         let mut rga = Rga::new();
 
-        let block1 = OpBlock::insert(None, 0, b"hello".to_vec());
+        let block1 = OpBlock::insert(None, None, 0, b"hello".to_vec());
         rga.apply(&pair.key_pub, &block1);
 
         let target = OpItemId {
@@ -1866,8 +2285,8 @@ mod tests {
 
         let mut rga = Rga::new();
 
-        let block_a = OpBlock::insert(None, 0, b"A".to_vec());
-        let block_b = OpBlock::insert(None, 0, b"B".to_vec());
+        let block_a = OpBlock::insert(None, None, 0, b"A".to_vec());
+        let block_b = OpBlock::insert(None, None, 0, b"B".to_vec());
 
         rga.apply(&alice.key_pub, &block_a);
         rga.apply(&bob.key_pub, &block_b);

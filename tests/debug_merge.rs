@@ -1,5 +1,6 @@
 //! Debug test for merge_divergent_edits failure
 
+use together::crdt::Crdt;
 use together::crdt::rga::Rga;
 use together::key::KeyPair;
 
