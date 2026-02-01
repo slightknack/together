@@ -22,7 +22,25 @@ flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 diamond-types = "1"  # Reference implementation for correctness testing
+criterion = "0.5"
+rand = "0.8"
 
 [[bench]]
 name = "version_bench"
 harness = false
+
+[[bench]]
+name = "rga_comparison"
+harness = false
+
+[[bin]]
+name = "rga_quick"
+path = "benches/rga_quick.rs"
+required-features = ["bench"]
+
+[features]
+bench = ["rand"]
+
+[dependencies.rand]
+version = "0.8"
+optional = true
