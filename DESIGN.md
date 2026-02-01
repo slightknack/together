@@ -281,3 +281,7 @@ Then, once all implementations work and pass all tests, benchmark them and:
 when you're done, you can read Scratchpad in Design, BUT NOT BEFORE THEN.
 
 Write a process document in procedures, including instructions for the agent responsible for spinning up subagents and maintaining a tree of progress and a summary of learnings.
+
+---
+
+Is our rga still persistent? Can we jump to any point in time?

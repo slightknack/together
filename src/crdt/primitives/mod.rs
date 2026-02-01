@@ -49,9 +49,21 @@
 //! - `LruCache`: general purpose with eviction
 
 pub mod clock;
+pub mod cursor;
 pub mod id;
+pub mod range_tree;
 pub mod span;
+pub mod user_table;
 
 // Re-exports for convenience
 pub use clock::LamportClock;
+pub use clock::VectorClock;
+pub use cursor::CursorCache;
+pub use cursor::SpanLocation;
+pub use cursor::BTreeLocation;
 pub use id::OpId;
+pub use id::ItemId;
+pub use id::CompactOpId;
+pub use id::UserIdx;
+pub use span::CompactSpan;
+pub use user_table::UserTable;

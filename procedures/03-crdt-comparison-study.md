@@ -313,36 +313,48 @@ Design operation encoding compatible with the signed append-only log described i
 
 ## Agent Coordination
 
+### Serial Execution
+
+Research and implementation for each library should be done serially, not in parallel. This ensures:
+
+1. **Learnings compound** - Insights from one library inform the next
+2. **Shared primitives evolve** - Each library may add to the primitives
+3. **Consistent quality** - Full attention on each implementation
+4. **Clearer progress** - Easier to track and review
+
 ### Primary Agent Responsibilities
 
-The primary agent (coordinator) should:
+The primary agent should:
 
-1. **Maintain progress tree** - Track which phases/libraries are complete
-2. **Spawn research agents** - One per library for parallel research
-3. **Review implementations** - Ensure quality and correctness
-4. **Synthesize learnings** - Combine insights across libraries
-5. **Write summary documents** - Keep learnings accessible
+1. **Research one library at a time** - Complete research before moving to next
+2. **Implement immediately after research** - While context is fresh
+3. **Update primitives as needed** - Add new building blocks
+4. **Commit after each library** - Clear git history
+5. **Update progress document** - Track learnings
 
-### Subagent Spawning Pattern
+### Research Order
 
-For each library research phase:
+Process libraries in this order (simpler to more complex):
 
-```
-Task: Research and implement {library}
-Subagent type: general-purpose
-Prompt: |
-  Research the {library} CRDT library in depth.
-  
-  1. Clone the repository and study the code
-  2. Find and read any papers/blog posts about it
-  3. Create research/{library}.md with the structure from the procedure
-  4. Implement src/crdt/{library}.rs implementing the Rga trait
-  5. Ensure all conformance tests pass
-  6. Run benchmarks and record results
-  
-  Use shared primitives from src/crdt/primitives where possible.
-  Add any new primitives needed.
-```
+1. **yjs** - Well-documented YATA algorithm, foundational
+2. **diamond-types** - Clear Rust code, good reference
+3. **cola** - Novel approach, well-explained
+4. **json-joy** - Advanced optimizations
+5. **loro** - Most complex, rich features
+
+### Per-Library Process
+
+For each library:
+
+1. Clone repository to /tmp/{library}
+2. Read papers/blog posts about the approach
+3. Study the source code in depth
+4. Write research document: research/crdt-{library}.md
+5. Implement: src/crdt/{library}.rs
+6. Run conformance tests
+7. Benchmark and record results
+8. Commit with descriptive message
+9. Move to next library
 
 ### Progress Tracking
 

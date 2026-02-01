@@ -7,6 +7,8 @@
 
 This document tracks progress on the comprehensive CRDT library comparison study.
 
+Libraries are researched and implemented serially (not in parallel) so learnings compound.
+
 ## Phase 1: Setup and Infrastructure
 
 - [x] Branch created: `crdt-comparison-study`
@@ -15,17 +17,22 @@ This document tracks progress on the comprehensive CRDT library comparison study
   - [x] `clock.rs` - LamportClock, VectorClock
   - [x] `id.rs` - OpId, ItemId, CompactOpId, UserIdx
   - [x] `span.rs` - CompactSpan with origins and split/coalesce
+  - [x] `cursor.rs` - CursorCache for sequential access optimization
+  - [x] `range_tree.rs` - Aggregate traits for range queries
+  - [x] `user_table.rs` - User ID to index mapping
 - [x] Conformance test infrastructure: `tests/rga_conformance.rs`
 
-## Phase 2: Research
+## Phase 2: Research and Implementation (Serial)
 
-| Library | Status | Research Doc | Notes |
-|---------|--------|--------------|-------|
-| diamond-types | not started | - | High-performance Rust CRDT |
-| loro | not started | - | Modern CRDT with rich types |
-| cola | not started | - | Composable local-first algorithms |
-| json-joy | not started | - | TypeScript CRDT with novel optimizations |
-| yjs | not started | - | Original production CRDT |
+Order: yjs -> diamond-types -> cola -> json-joy -> loro
+
+| Library | Research | Implementation | Notes |
+|---------|----------|----------------|-------|
+| yjs | in progress | not started | YATA algorithm, foundational |
+| diamond-types | pending | pending | Clear Rust reference |
+| cola | pending | pending | Novel approach |
+| json-joy | pending | pending | Advanced optimizations |
+| loro | pending | pending | Most complex |
 
 ## Phase 3: Implementation
 
