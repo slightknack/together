@@ -71,6 +71,7 @@
 
 use crate::key::KeyPub;
 use super::btree_list::BTreeList;
+use super::log_integration::{OpLog, Operation, OperationId};
 use super::primitives::{UserTable, LamportClock, UserIdx};
 use super::rga_trait::Rga;
 
@@ -781,6 +782,134 @@ impl Rga for OptimizedRga {
 
     fn span_count(&self) -> usize {
         return self.spans.len();
+    }
+}
+
+// =============================================================================
+// OpLog Implementation
+// =============================================================================
+
+impl OpLog for OptimizedRga {
+    fn export_operations(&self) -> Vec<Operation> {
+        let mut ops = Vec::new();
+
+        // First, collect all insert operations
+        for span in self.spans.iter() {
+            // Get the user's public key
+            let user = match self.users.get_id(span.user_idx) {
+                Some(u) => u.clone(),
+                None => continue,
+            };
+
+            // Convert origin indices to OperationIds
+            let origin_left = span.origin_left.and_then(|(user_idx, seq)| {
+                let origin_user = self.users.get_id(user_idx)?;
+                Some(OperationId::new(origin_user.clone(), seq))
+            });
+
+            let origin_right = span.origin_right.and_then(|(user_idx, seq)| {
+                let origin_user = self.users.get_id(user_idx)?;
+                Some(OperationId::new(origin_user.clone(), seq))
+            });
+
+            // Get the content
+            let content = self.get_content(span.user_idx, span.content_offset, span.len).to_vec();
+
+            // Create insert operation
+            let insert_op = Operation::insert(
+                user.clone(),
+                span.seq,
+                origin_left,
+                origin_right,
+                content,
+            );
+            ops.push(insert_op);
+        }
+
+        // Then, collect all delete operations (after inserts for causal ordering)
+        for span in self.spans.iter() {
+            if span.deleted {
+                let user = match self.users.get_id(span.user_idx) {
+                    Some(u) => u.clone(),
+                    None => continue,
+                };
+                let delete_op = Operation::delete(user, span.seq, span.len);
+                ops.push(delete_op);
+            }
+        }
+
+        return ops;
+    }
+
+    fn from_operations(ops: impl Iterator<Item = Operation>) -> Self {
+        let mut rga = OptimizedRga::new();
+
+        for op in ops {
+            rga.apply_operation(op);
+        }
+
+        return rga;
+    }
+
+    fn apply_operation(&mut self, op: Operation) -> bool {
+        match op {
+            Operation::Insert {
+                user,
+                seq,
+                origin_left,
+                origin_right,
+                content,
+            } => {
+                // Ensure user exists
+                let user_idx = self.ensure_user(&user);
+
+                // Check if we already have this operation
+                for span in self.spans.iter() {
+                    if span.user_idx == user_idx && span.contains(user_idx, seq) {
+                        return false; // Already have this operation
+                    }
+                }
+
+                // Ensure content buffer has space
+                let user_content = &mut self.user_content[user_idx.0 as usize];
+                let content_offset = user_content.content.len() as u32;
+                user_content.content.extend_from_slice(&content);
+
+                // Convert OperationIds to internal (UserIdx, seq) format
+                let left_origin = origin_left.map(|id| {
+                    let idx = self.ensure_user(&id.user);
+                    (idx, id.seq)
+                });
+
+                let right_origin = origin_right.map(|id| {
+                    let idx = self.ensure_user(&id.user);
+                    (idx, id.seq)
+                });
+
+                // Create and insert span
+                let span = Span::new(
+                    user_idx,
+                    seq,
+                    content.len() as u32,
+                    content_offset,
+                    left_origin,
+                    right_origin,
+                );
+
+                self.insert_span(span);
+                return true;
+            }
+
+            Operation::Delete {
+                target_user,
+                target_seq,
+                len,
+            } => {
+                let user_idx = self.ensure_user(&target_user);
+                self.apply_deletion_range(user_idx, target_seq, len);
+                return true;
+            }
+        }
     }
 }
 
