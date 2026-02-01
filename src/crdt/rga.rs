@@ -186,6 +186,24 @@ impl OriginId {
     }
 }
 
+// =============================================================================
+// YATA Ordering
+// =============================================================================
+
+/// Result of YATA/FugueMax comparison between two sibling spans.
+///
+/// When two spans share the same left origin (siblings), we use YATA rules
+/// to determine their order:
+/// 1. Compare right origins (null = "inserted at end" = infinity)
+/// 2. If equal, compare (user, seq) descending
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YataOrder {
+    /// The new span comes BEFORE the existing span.
+    Before,
+    /// The new span comes AFTER the existing span.
+    After,
+}
+
 /// A compact span of consecutive items inserted by the same user (30 bytes).
 /// 
 /// Stores both left origin and right origin to match Yjs/YATA/Fugue approach.
@@ -1168,6 +1186,232 @@ impl Rga {
         }
     }
 
+    // =========================================================================
+    // YATA Ordering Helpers
+    // =========================================================================
+
+    /// Compare two sibling spans using YATA/FugueMax ordering rules.
+    ///
+    /// Both spans must share the same left origin (be siblings).
+    /// Returns whether `new_span` should come Before or After `existing`.
+    ///
+    /// YATA rules:
+    /// 1. Compare right origins: null = "inserted at end" = infinity
+    ///    - Non-null (finite) comes BEFORE null (infinite)
+    ///    - Higher right_origin ID comes FIRST (inserted with more context)
+    /// 2. If right origins equal: higher (user, seq) comes FIRST
+    fn yata_compare(
+        &self,
+        new_right_origin: OriginId,
+        new_has_right_origin: bool,
+        new_user: KeyPub,
+        new_seq: u32,
+        existing: &Span,
+    ) -> YataOrder {
+        let existing_has_ro = existing.has_right_origin();
+        
+        // Rule 1a: Compare null vs non-null right origin
+        if new_has_right_origin != existing_has_ro {
+            if !existing_has_ro && new_has_right_origin {
+                // Existing has no right origin (infinity), we have one (finite)
+                // Finite < infinity, so we come BEFORE
+                return YataOrder::Before;
+            } else {
+                // We have no right origin (infinity), existing has one (finite)
+                // Finite < infinity, so existing comes before us
+                return YataOrder::After;
+            }
+        }
+        
+        // Rule 1b: Both have right origins - compare IDs
+        if new_has_right_origin && existing_has_ro {
+            let existing_ro = existing.right_origin();
+            
+            let existing_ro_user = match self.users.get_key(existing_ro.user_idx) {
+                Some(u) => *u,
+                None => return YataOrder::After, // Unknown user, skip existing
+            };
+            let new_ro_user = match self.users.get_key(new_right_origin.user_idx) {
+                Some(u) => *u,
+                None => return YataOrder::Before, // Unknown user, insert here
+            };
+            
+            let existing_ro_key = (existing_ro_user, existing_ro.seq);
+            let new_ro_key = (new_ro_user, new_right_origin.seq);
+            
+            if existing_ro_key > new_ro_key {
+                // Existing's right origin is higher - existing was inserted later
+                return YataOrder::After;
+            } else if existing_ro_key < new_ro_key {
+                // Our right origin is higher - we were inserted later
+                return YataOrder::Before;
+            }
+            // Equal, fall through to tiebreaker
+        }
+        
+        // Rule 2: Right origins equal - use (user, seq) as tiebreaker
+        let existing_user = *self.users.get_key(existing.user_idx).unwrap();
+        if (existing_user, existing.seq) > (new_user, new_seq) {
+            // Existing has higher precedence
+            return YataOrder::After;
+        }
+        // We have higher or equal precedence
+        return YataOrder::Before;
+    }
+
+    /// Check if a span's origin is within any of the tracked subtree ranges.
+    #[inline]
+    fn origin_in_subtree(origin: OriginId, subtree_ranges: &[(u16, u32, u32)]) -> bool {
+        subtree_ranges.iter().any(|&(user_idx, seq_start, seq_end)| {
+            origin.user_idx == user_idx 
+                && origin.seq >= seq_start 
+                && origin.seq <= seq_end
+        })
+    }
+
+    /// Add a span's range to the subtree tracking.
+    #[inline]
+    fn add_to_subtree(span: &Span, subtree_ranges: &mut Vec<(u16, u32, u32)>) {
+        subtree_ranges.push((span.user_idx, span.seq, span.seq + span.len - 1));
+    }
+
+    /// Check if `other` is a sibling of the span being inserted.
+    /// Siblings share the same left origin.
+    fn is_sibling(&self, other: &Span, origin_user: KeyPub, origin_seq: u64) -> bool {
+        if !other.has_origin() {
+            return false;
+        }
+        let other_origin = other.origin();
+        let other_origin_user = match self.users.get_key(other_origin.user_idx) {
+            Some(u) => *u,
+            None => return false,
+        };
+        other_origin_user == origin_user && other_origin.seq as u64 == origin_seq
+    }
+
+    // =========================================================================
+    // Insert Position Finding
+    // =========================================================================
+
+    /// Find insertion position when the new span has a left origin.
+    ///
+    /// Scans right from the origin, comparing with siblings using YATA rules.
+    /// Skips descendants of siblings we pass over.
+    /// Returns the index where the new span should be inserted.
+    fn find_position_with_origin(
+        &mut self,
+        origin_id: &ItemId,
+        span_user: KeyPub,
+        span_seq: u32,
+        span_right_origin: OriginId,
+        span_has_right_origin: bool,
+    ) -> usize {
+        // Find the left origin span
+        let origin_idx = match self.find_span_by_id(origin_id) {
+            Some(idx) => idx,
+            None => return self.spans.len(), // Origin not found, insert at end
+        };
+        
+        // Split origin span if needed
+        let origin_span = self.spans.get(origin_idx).unwrap();
+        let offset_in_span = (origin_id.seq as u32) - origin_span.seq;
+        if offset_in_span < origin_span.len - 1 {
+            let mut existing = self.spans.remove(origin_idx);
+            let right = existing.split(offset_in_span + 1);
+            self.spans.insert(origin_idx, existing, existing.visible_len() as u64);
+            self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
+        }
+        
+        // Initialize subtree tracking with just the origin
+        let origin_user_idx = self.ensure_user(&origin_id.user);
+        let mut subtree_ranges: Vec<(u16, u32, u32)> = vec![
+            (origin_user_idx, origin_id.seq as u32, origin_id.seq as u32)
+        ];
+        
+        let mut pos = origin_idx + 1;
+        
+        while pos < self.spans.len() {
+            let other = self.spans.get(pos).unwrap();
+            
+            // Check if this span is a sibling
+            if !self.is_sibling(other, origin_id.user, origin_id.seq) {
+                // Not a sibling - check if it's a descendant
+                if other.has_origin() {
+                    let other_origin = other.origin();
+                    if Self::origin_in_subtree(other_origin, &subtree_ranges) {
+                        Self::add_to_subtree(other, &mut subtree_ranges);
+                        pos += 1;
+                        continue;
+                    }
+                }
+                // Not in subtree - we've exited
+                break;
+            }
+            
+            // It's a sibling - use YATA comparison
+            let order = self.yata_compare(
+                span_right_origin,
+                span_has_right_origin,
+                span_user,
+                span_seq,
+                other,
+            );
+            
+            match order {
+                YataOrder::Before => break,
+                YataOrder::After => {
+                    Self::add_to_subtree(other, &mut subtree_ranges);
+                    pos = self.skip_subtree(pos);
+                }
+            }
+        }
+        
+        pos
+    }
+
+    /// Find insertion position when the new span has no left origin (root level).
+    ///
+    /// Scans from the beginning, comparing with other root-level spans.
+    /// Skips descendants of root spans we pass over.
+    /// Returns the index where the new span should be inserted.
+    fn find_position_at_root(
+        &self,
+        span_user: KeyPub,
+        span_seq: u32,
+        span_right_origin: OriginId,
+        span_has_right_origin: bool,
+    ) -> usize {
+        let mut pos = 0;
+        
+        while pos < self.spans.len() {
+            let other = self.spans.get(pos).unwrap();
+            
+            // Skip descendants (spans with origins)
+            if other.has_origin() {
+                pos += 1;
+                continue;
+            }
+            
+            // Root-level sibling - use YATA comparison
+            let order = self.yata_compare(
+                span_right_origin,
+                span_has_right_origin,
+                span_user,
+                span_seq,
+                other,
+            );
+            
+            match order {
+                YataOrder::Before => break,
+                YataOrder::After => {
+                    pos = self.skip_subtree(pos);
+                }
+            }
+        }
+        
+        pos
+    }
+
     /// Skip over a span and its entire subtree.
     /// 
     /// In RGA, spans form a tree where each span's children are spans whose origin
@@ -1243,282 +1487,59 @@ impl Rga {
     /// The right_origin is the character that was immediately to the RIGHT when inserted.
     /// 
     /// The YATA/FugueMax algorithm uses both origins to achieve correct merge commutativity:
-    /// 1. Find position of left origin (L)
-    /// 2. Scan right from L, comparing with each existing item O
-    /// 3. For each O with same left origin as us (siblings):
-    ///    - If O.right_origin != our right_origin: use right origin as tiebreaker
-    ///    - If right origins match: use (user, seq) descending as tiebreaker
-    /// 4. Stop when we exit the subtree (O.left_origin != L)
-    /// 5. When skipping a sibling, skip its entire subtree
-    fn insert_span_rga(&mut self, mut span: Span, left_origin: Option<ItemId>, right_origin: Option<ItemId>) {
+    /// Insert a span using YATA/FugueMax ordering rules with dual origins.
+    ///
+    /// The algorithm:
+    /// 1. Set origins on the span
+    /// 2. Find insertion position using YATA rules
+    /// 3. Insert at that position
+    ///
+    /// See `find_position_with_origin` and `find_position_at_root` for details.
+    fn insert_span_rga(
+        &mut self,
+        mut span: Span,
+        left_origin: Option<ItemId>,
+        right_origin: Option<ItemId>,
+    ) {
         let span_len = span.visible_len() as u64;
 
+        // Set origins on the span
+        if let Some(ref origin_id) = left_origin {
+            let origin_user_idx = self.ensure_user(&origin_id.user);
+            span.set_origin(OriginId::some(origin_user_idx, origin_id.seq as u32));
+        }
+        if let Some(ref ro) = right_origin {
+            let ro_user_idx = self.ensure_user(&ro.user);
+            span.set_right_origin(OriginId::some(ro_user_idx, ro.seq as u32));
+        }
+
+        // Handle empty document
         if self.spans.is_empty() {
-            // Set origins on span even for first insert
-            if let Some(ref ro) = right_origin {
-                let ro_user_idx = self.ensure_user(&ro.user);
-                span.set_right_origin(OriginId::some(ro_user_idx, ro.seq as u32));
-            }
             self.spans.insert(0, span, span_len);
             return;
         }
 
+        // Get span info for YATA comparison
+        let span_user = *self.users.get_key(span.user_idx).unwrap();
+        let span_right_origin = span.right_origin();
+        let span_has_right_origin = span.has_right_origin();
+
+        // Find insertion position
         let insert_idx = if let Some(ref origin_id) = left_origin {
-            // Set the left origin on the span
-            let origin_user_idx = self.ensure_user(&origin_id.user);
-            span.set_origin(OriginId::some(origin_user_idx, origin_id.seq as u32));
-            
-            // Set the right origin if present
-            if let Some(ref ro) = right_origin {
-                let ro_user_idx = self.ensure_user(&ro.user);
-                span.set_right_origin(OriginId::some(ro_user_idx, ro.seq as u32));
-            }
-            
-            // Find the left origin span
-            if let Some(origin_idx) = self.find_span_by_id(origin_id) {
-                let origin_span = self.spans.get(origin_idx).unwrap();
-                let offset_in_span = (origin_id.seq as u32) - origin_span.seq;
-
-                // If origin is in the middle of a span, split it
-                if offset_in_span < origin_span.len - 1 {
-                    let mut existing = self.spans.remove(origin_idx);
-                    let right = existing.split(offset_in_span + 1);
-                    self.spans.insert(origin_idx, existing, existing.visible_len() as u64);
-                    self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
-                }
-
-                // YATA/FugueMax algorithm:
-                // Scan right from left origin, comparing only with siblings.
-                // Skip over non-siblings (descendants of siblings).
-                // Stop when we find a sibling we should come before.
-                //
-                // Key insight: we ONLY compare with siblings that share our exact left origin.
-                // Non-siblings are either descendants (skip them) or from different branches (stop).
-                //
-                // To track the subtree boundary, we maintain a set of (user, seq) ranges
-                // that are part of the subtree rooted at our origin. A span is in the
-                // subtree if its origin is within any of these ranges.
-                
-                let mut pos = origin_idx + 1;
-                
-                // Track all (user_idx, seq_start, seq_end) ranges in the subtree of our origin
-                // Initially contains just the origin itself
-                let origin_user_idx = self.ensure_user(&origin_id.user);
-                let mut subtree_ranges: Vec<(u16, u32, u32)> = vec![
-                    (origin_user_idx, origin_id.seq as u32, origin_id.seq as u32)
-                ];
-                
-                // Get span info after ensure_user to avoid borrow conflicts
-                let span_user = *self.users.get_key(span.user_idx).unwrap();
-                let span_right_origin = span.right_origin();
-                
-                // NOTE: We do NOT use right_origin position as a boundary.
-                // The YATA/FugueMax algorithm compares right_origins as IDs, not positions.
-                // Using position would break commutativity because positions differ between replicas.
-                
-                while pos < self.spans.len() {
-                    let other = self.spans.get(pos).unwrap();
-                    
-                    // Check if this span is a sibling (same left origin as us)
-                    if !other.has_origin() {
-                        // No-origin span - different branch, stop here
-                        break;
-                    }
-                    
-                    let other_origin = other.origin();
-                    let other_origin_user = match self.users.get_key(other_origin.user_idx) {
-                        Some(u) => *u,
-                        None => break,
-                    };
-                    
-                    let is_sibling = other_origin_user == origin_id.user 
-                        && other_origin.seq as u64 == origin_id.seq;
-                    
-                    if !is_sibling {
-                        // Not a sibling. Check if this span's origin is within our subtree.
-                        // If so, it's a descendant of some sibling - add it to subtree and continue.
-                        // If not, we've exited the subtree - stop here.
-                        let is_in_subtree = subtree_ranges.iter().any(|&(user_idx, seq_start, seq_end)| {
-                            other_origin.user_idx == user_idx 
-                                && other_origin.seq >= seq_start 
-                                && other_origin.seq <= seq_end
-                        });
-                        
-                        if is_in_subtree {
-                            // Add this span to the subtree
-                            subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
-                            pos += 1;
-                            continue;
-                        } else {
-                            // Not in subtree - we've exited, stop here
-                            break;
-                        }
-                    }
-                    
-                    // This is a sibling - compare using YATA rules:
-                    // 1. Compare right origins
-                    // 2. If equal, compare (user, seq)
-                    
-                    let other_right_origin = other.right_origin();
-                    
-                    // Right origin comparison
-                    // YATA/Yjs semantics: null rightOrigin = "inserted at end" = infinite position
-                    // Items with non-null rightOrigin come BEFORE items with null rightOrigin
-                    if other.has_right_origin() != span.has_right_origin() {
-                        if !other.has_right_origin() && span.has_right_origin() {
-                            // Other has no right origin (inserted at end = infinite)
-                            // We have a right origin (finite position)
-                            // Finite < infinite, so we come BEFORE other -> insert here
-                            break;
-                        } else {
-                            // We have no right origin (inserted at end = infinite)
-                            // Other has a right origin (finite position)
-                            // Finite < infinite, so other comes BEFORE us -> skip other, continue
-                            subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
-                            pos = self.skip_subtree(pos);
-                            continue;
-                        }
-                    }
-                    
-                    if other.has_right_origin() && span.has_right_origin() {
-                        let other_ro_user = match self.users.get_key(other_right_origin.user_idx) {
-                            Some(u) => *u,
-                            None => { 
-                                subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
-                                pos = self.skip_subtree(pos); 
-                                continue; 
-                            }
-                        };
-                        let span_ro_user = match self.users.get_key(span_right_origin.user_idx) {
-                            Some(u) => *u,
-                            None => break,
-                        };
-                        
-                        // YATA rule: Higher right origin = inserted later with more context
-                        // = should come FIRST in the document
-                        let other_ro_key = (other_ro_user, other_right_origin.seq);
-                        let span_ro_key = (span_ro_user, span_right_origin.seq);
-                        
-                        if other_ro_key > span_ro_key {
-                            // Other's right origin is higher - other was inserted later, comes first
-                            // Add to subtree and skip
-                            subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
-                            pos = self.skip_subtree(pos);
-                            continue;
-                        } else if other_ro_key < span_ro_key {
-                            // Our right origin is higher - we were inserted later, come first
-                            break;
-                        }
-                    }
-                    
-                    // Right origins are equal - use (user, seq) as tiebreaker
-                    // Higher (user, seq) = earlier in document
-                    let other_user = *self.users.get_key(other.user_idx).unwrap();
-                    if (other_user, other.seq) > (span_user, span.seq) {
-                        // Other has higher precedence - add to subtree and skip
-                        subtree_ranges.push((other.user_idx, other.seq, other.seq + other.len - 1));
-                        pos = self.skip_subtree(pos);
-                        continue;
-                    }
-                    // We have higher or equal precedence - insert here
-                    break;
-                }
-                pos
-            } else {
-                // Left origin not found - insert at end
-                self.spans.len()
-            }
+            self.find_position_with_origin(
+                origin_id,
+                span_user,
+                span.seq,
+                span_right_origin,
+                span_has_right_origin,
+            )
         } else {
-            // No left origin - this span is at the root level (inserted at position 0)
-            // Set right origin if present
-            if let Some(ref ro) = right_origin {
-                let ro_user_idx = self.ensure_user(&ro.user);
-                span.set_right_origin(OriginId::some(ro_user_idx, ro.seq as u32));
-            }
-            
-            // YATA/FugueMax for root-level spans:
-            // All no-origin spans are siblings at the root.
-            // Spans with origins are descendants of root spans - skip them.
-            let mut pos = 0;
-            let span_user = *self.users.get_key(span.user_idx).unwrap();
-            let span_right_origin = span.right_origin();
-            
-            // NOTE: We do NOT use right_origin position as a boundary.
-            // The YATA/FugueMax algorithm compares right_origins as IDs, not positions.
-            // Using position would break commutativity because positions differ between replicas.
-            
-            while pos < self.spans.len() {
-                let other = self.spans.get(pos).unwrap();
-                
-                if other.has_origin() {
-                    // This span has an origin - it's a descendant of some root span
-                    // Skip it (but not its subtree, since we're iterating and will
-                    // naturally skip descendants)
-                    pos += 1;
-                    continue;
-                }
-                
-                // Another root-level span (no origin) - this is a sibling
-                let other_right_origin = other.right_origin();
-                
-                // Compare right origins first
-                // YATA/Yjs semantics: null rightOrigin = "inserted at end" = infinite position
-                // Items with non-null rightOrigin come BEFORE items with null rightOrigin
-                if other.has_right_origin() != span.has_right_origin() {
-                    if !other.has_right_origin() && span.has_right_origin() {
-                        // Other has no right origin (inserted at end = infinite)
-                        // We have a right origin (finite position)
-                        // Finite < infinite, so we come BEFORE other -> insert here
-                        break;
-                    } else {
-                        // We have no right origin (inserted at end = infinite)
-                        // Other has a right origin (finite position)
-                        // Finite < infinite, so other comes BEFORE us -> skip other, continue
-                        pos = self.skip_subtree(pos);
-                        continue;
-                    }
-                }
-                
-                if other.has_right_origin() && span.has_right_origin() {
-                    let other_ro_user = match self.users.get_key(other_right_origin.user_idx) {
-                        Some(u) => *u,
-                        None => { 
-                            pos = self.skip_subtree(pos); 
-                            continue; 
-                        }
-                    };
-                    let span_ro_user = match self.users.get_key(span_right_origin.user_idx) {
-                        Some(u) => *u,
-                        None => {
-                            break;
-                        }
-                    };
-                    
-                    let other_ro_key = (other_ro_user, other_right_origin.seq);
-                    let span_ro_key = (span_ro_user, span_right_origin.seq);
-                    
-                    if other_ro_key > span_ro_key {
-                        // Other's right origin is higher - other was inserted later, comes first
-                        // Skip other AND its subtree
-                        pos = self.skip_subtree(pos);
-                        continue;
-                    } else if other_ro_key < span_ro_key {
-                        // Our right origin is higher - we were inserted later, come first
-                        break;
-                    }
-                }
-                
-                // Right origins equal - use (user, seq) as tiebreaker
-                let other_user = *self.users.get_key(other.user_idx).unwrap();
-                if (other_user, other.seq) > (span_user, span.seq) {
-                    // Other has higher precedence - skip it AND its subtree
-                    pos = self.skip_subtree(pos);
-                    continue;
-                }
-                // We have higher or equal precedence - insert before
-                break;
-            }
-            pos
+            self.find_position_at_root(
+                span_user,
+                span.seq,
+                span_right_origin,
+                span_has_right_origin,
+            )
         };
 
         self.spans.insert(insert_idx, span, span_len);
