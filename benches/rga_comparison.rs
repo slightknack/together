@@ -19,6 +19,7 @@ use together::crdt::diamond::DiamondRga;
 use together::crdt::cola::ColaRga;
 use together::crdt::json_joy::JsonJoyRga;
 use together::crdt::loro::LoroRga;
+use together::crdt::rga_optimized::OptimizedRga;
 use together::key::KeyPair;
 
 // Helper to create users with deterministic keys for reproducibility
@@ -168,6 +169,15 @@ fn bench_sequential_forward(c: &mut Criterion) {
                 black_box(rga.len())
             });
         });
+        
+        group.bench_with_input(BenchmarkId::new("OptimizedRga", size), &content, |b, content| {
+            let user = KeyPair::generate();
+            b.iter(|| {
+                let mut rga = OptimizedRga::new();
+                sequential_forward(&mut rga, &user.key_pub, content);
+                black_box(rga.len())
+            });
+        });
     }
     
     group.finish();
@@ -226,6 +236,15 @@ fn bench_sequential_backward(c: &mut Criterion) {
             let user = KeyPair::generate();
             b.iter(|| {
                 let mut rga = LoroRga::new();
+                sequential_backward(&mut rga, &user.key_pub, content);
+                black_box(rga.len())
+            });
+        });
+        
+        group.bench_with_input(BenchmarkId::new("OptimizedRga", size), &content, |b, content| {
+            let user = KeyPair::generate();
+            b.iter(|| {
+                let mut rga = OptimizedRga::new();
                 sequential_backward(&mut rga, &user.key_pub, content);
                 black_box(rga.len())
             });
@@ -292,6 +311,16 @@ fn bench_random_inserts(c: &mut Criterion) {
             let user = KeyPair::generate();
             b.iter(|| {
                 let mut rga = LoroRga::new();
+                let mut rng = StdRng::seed_from_u64(42);
+                random_inserts(&mut rga, &user.key_pub, content, &mut rng);
+                black_box(rga.len())
+            });
+        });
+        
+        group.bench_with_input(BenchmarkId::new("OptimizedRga", size), &content, |b, content| {
+            let user = KeyPair::generate();
+            b.iter(|| {
+                let mut rga = OptimizedRga::new();
                 let mut rng = StdRng::seed_from_u64(42);
                 random_inserts(&mut rga, &user.key_pub, content, &mut rng);
                 black_box(rga.len())
@@ -375,6 +404,18 @@ fn bench_random_deletes(c: &mut Criterion) {
                 black_box(rga.len())
             });
         });
+        
+        group.bench_with_input(BenchmarkId::new("OptimizedRga", size), &size, |b, &size| {
+            let user = KeyPair::generate();
+            b.iter(|| {
+                let mut rga = OptimizedRga::new();
+                let content: Vec<u8> = (0..size).map(|i| b'a' + (i % 26) as u8).collect();
+                rga.insert(&user.key_pub, 0, &content);
+                let mut rng = StdRng::seed_from_u64(42);
+                random_deletes(&mut rga, size, &mut rng);
+                black_box(rga.len())
+            });
+        });
     }
     
     group.finish();
@@ -436,6 +477,16 @@ fn bench_mixed_operations(c: &mut Criterion) {
             let user = KeyPair::generate();
             b.iter(|| {
                 let mut rga = LoroRga::new();
+                let mut rng = StdRng::seed_from_u64(42);
+                mixed_operations(&mut rga, &user.key_pub, size, &mut rng);
+                black_box(rga.len())
+            });
+        });
+        
+        group.bench_with_input(BenchmarkId::new("OptimizedRga", size), &size, |b, &size| {
+            let user = KeyPair::generate();
+            b.iter(|| {
+                let mut rga = OptimizedRga::new();
                 let mut rng = StdRng::seed_from_u64(42);
                 mixed_operations(&mut rga, &user.key_pub, size, &mut rng);
                 black_box(rga.len())
@@ -520,6 +571,19 @@ fn bench_large_merge(c: &mut Criterion) {
             b.iter(|| {
                 let mut rga_a = LoroRga::new();
                 let mut rga_b = LoroRga::new();
+                rga_a.insert(&user1.key_pub, 0, &content_a);
+                rga_b.insert(&user2.key_pub, 0, &content_b);
+                rga_a.merge(&rga_b);
+                black_box(rga_a.len())
+            });
+        });
+        
+        group.bench_with_input(BenchmarkId::new("OptimizedRga", size), &size, |b, _| {
+            let user1 = KeyPair::generate();
+            let user2 = KeyPair::generate();
+            b.iter(|| {
+                let mut rga_a = OptimizedRga::new();
+                let mut rga_b = OptimizedRga::new();
                 rga_a.insert(&user1.key_pub, 0, &content_a);
                 rga_b.insert(&user2.key_pub, 0, &content_b);
                 rga_a.merge(&rga_b);
@@ -639,6 +703,28 @@ fn bench_many_small_merges(c: &mut Criterion) {
             b.iter(|| {
                 let users: Vec<_> = (0..num_users).map(|_| KeyPair::generate()).collect();
                 let mut rgas: Vec<_> = (0..num_users).map(|_| LoroRga::new()).collect();
+                
+                for (i, (user, rga)) in users.iter().zip(rgas.iter_mut()).enumerate() {
+                    let content: Vec<u8> = (0..edits_per_user)
+                        .map(|j| b'a' + ((i * edits_per_user + j) % 26) as u8)
+                        .collect();
+                    for (j, byte) in content.iter().enumerate() {
+                        rga.insert(&user.key_pub, j as u64, &[*byte]);
+                    }
+                }
+                
+                let mut merged = rgas.remove(0);
+                for rga in &rgas {
+                    merged.merge(rga);
+                }
+                black_box(merged.len())
+            });
+        });
+        
+        group.bench_with_input(BenchmarkId::new("OptimizedRga", num_users), &num_users, |b, &num_users| {
+            b.iter(|| {
+                let users: Vec<_> = (0..num_users).map(|_| KeyPair::generate()).collect();
+                let mut rgas: Vec<_> = (0..num_users).map(|_| OptimizedRga::new()).collect();
                 
                 for (i, (user, rga)) in users.iter().zip(rgas.iter_mut()).enumerate() {
                     let content: Vec<u8> = (0..edits_per_user)

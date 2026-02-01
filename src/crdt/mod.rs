@@ -13,6 +13,7 @@ pub mod loro;
 pub mod op;
 pub mod primitives;
 pub mod rga;
+pub mod rga_optimized;
 pub mod rga_trait;
 pub mod yjs;
 

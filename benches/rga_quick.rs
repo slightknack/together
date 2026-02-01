@@ -8,6 +8,7 @@ use together::crdt::diamond::DiamondRga;
 use together::crdt::cola::ColaRga;
 use together::crdt::json_joy::JsonJoyRga;
 use together::crdt::loro::LoroRga;
+use together::crdt::rga_optimized::OptimizedRga;
 use together::key::KeyPair;
 
 use rand::{Rng, SeedableRng};
@@ -106,6 +107,7 @@ fn main() {
     bench_impl!("ColaRga", ColaRga, &user, &content, 42);
     bench_impl!("JsonJoyRga", JsonJoyRga, &user, &content, 42);
     bench_impl!("LoroRga", LoroRga, &user, &content, 42);
+    bench_impl!("OptimizedRga", OptimizedRga, &user, &content, 42);
     
     println!();
     
@@ -428,6 +430,70 @@ fn main() {
         println!(" {:>10.0} |", ns / 1000.0);
     }
     
+    // OptimizedRga 1000
+    {
+        let user = KeyPair::generate();
+        let content = content_1k.clone();
+        let ns = time_ops("seq", || {
+            let mut rga = OptimizedRga::new();
+            for (i, byte) in content.iter().enumerate() {
+                rga.insert(&user.key_pub, i as u64, &[*byte]);
+            }
+            rga.len()
+        }, 20);
+        print!("| {:12} | {:>10.0} |", "OptimizedRga", ns / 1000.0);
+    }
+    
+    {
+        let user = KeyPair::generate();
+        let content = content_1k.clone();
+        let ns = time_ops("rand", || {
+            let mut rga = OptimizedRga::new();
+            let mut rng = StdRng::seed_from_u64(42);
+            for byte in content.iter() {
+                let len = rga.len();
+                let pos = if len == 0 { 0 } else { rng.gen_range(0..=len) };
+                rga.insert(&user.key_pub, pos, &[*byte]);
+            }
+            rga.len()
+        }, 20);
+        print!(" {:>10.0} |", ns / 1000.0);
+    }
+    
+    {
+        let user = KeyPair::generate();
+        let content = content_1k.clone();
+        let ns = time_ops("del", || {
+            let mut rga = OptimizedRga::new();
+            rga.insert(&user.key_pub, 0, &content);
+            let mut rng = StdRng::seed_from_u64(42);
+            for _ in 0..1000 {
+                let len = rga.len();
+                if len == 0 { break; }
+                let pos = rng.gen_range(0..len);
+                rga.delete(pos, 1);
+            }
+            rga.len()
+        }, 20);
+        print!(" {:>10.0} |", ns / 1000.0);
+    }
+    
+    {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        let content_a: Vec<u8> = (0..1000).map(|i| b'A' + (i % 26) as u8).collect();
+        let content_b: Vec<u8> = (0..1000).map(|i| b'a' + (i % 26) as u8).collect();
+        let ns = time_ops("merge", || {
+            let mut rga_a = OptimizedRga::new();
+            let mut rga_b = OptimizedRga::new();
+            rga_a.insert(&user1.key_pub, 0, &content_a);
+            rga_b.insert(&user2.key_pub, 0, &content_b);
+            rga_a.merge(&rga_b);
+            rga_a.len()
+        }, 20);
+        println!(" {:>10.0} |", ns / 1000.0);
+    }
+    
     println!();
     
     // Memory/fragmentation test
@@ -582,6 +648,37 @@ fn main() {
         let merged_spans = rga_a.span_count();
         
         println!("| {:12} | {:>10} | {:>10} | {:>10} |", "LoroRga", seq_spans, rand_spans, merged_spans);
+    }
+    
+    // OptimizedRga
+    {
+        let user = KeyPair::generate();
+        let mut rga = OptimizedRga::new();
+        for (i, byte) in content_1k.iter().enumerate() {
+            rga.insert(&user.key_pub, i as u64, &[*byte]);
+        }
+        let seq_spans = rga.span_count();
+        
+        let mut rga = OptimizedRga::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        for byte in content_1k.iter() {
+            let len = rga.len();
+            let pos = if len == 0 { 0 } else { rng.gen_range(0..=len) };
+            rga.insert(&user.key_pub, pos, &[*byte]);
+        }
+        let rand_spans = rga.span_count();
+        
+        let user2 = KeyPair::generate();
+        let mut rga_a = OptimizedRga::new();
+        let mut rga_b = OptimizedRga::new();
+        let content_a: Vec<u8> = (0..1000).map(|i| b'A' + (i % 26) as u8).collect();
+        let content_b: Vec<u8> = (0..1000).map(|i| b'a' + (i % 26) as u8).collect();
+        rga_a.insert(&user.key_pub, 0, &content_a);
+        rga_b.insert(&user2.key_pub, 0, &content_b);
+        rga_a.merge(&rga_b);
+        let merged_spans = rga_a.span_count();
+        
+        println!("| {:12} | {:>10} | {:>10} | {:>10} |", "OptimizedRga", seq_spans, rand_spans, merged_spans);
     }
     
     println!();
