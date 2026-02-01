@@ -24,6 +24,8 @@
 
 use std::sync::Arc;
 
+use std::collections::BTreeMap;
+
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -203,6 +205,70 @@ enum YataOrder {
     /// The new span comes AFTER the existing span.
     After,
 }
+/// A key for ordering siblings in YATA order.
+/// 
+/// Implements Ord to match YATA comparison rules:
+/// 1. If A has right_origin and B doesn't: A < B (A comes first in document)
+/// 2. If both have right_origin: higher ID comes first
+/// 3. If equal right_origin: higher (user, seq) comes first
+/// 
+/// For BTreeMap ordering, "comes first" = smaller key.
+/// So we invert: higher values = smaller keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SiblingKey {
+    /// Right origin for YATA comparison.
+    /// None means "inserted at end" = infinity = comes last.
+    /// We store (user_idx, seq) for compactness.
+    right_origin: Option<(u16, u32)>,
+    /// User index of this span.
+    user_idx: u16,
+    /// Sequence number of this span.
+    seq: u32,
+}
+
+impl SiblingKey {
+    fn new(right_origin: Option<(u16, u32)>, user_idx: u16, seq: u32) -> SiblingKey {
+        SiblingKey { right_origin, user_idx, seq }
+    }
+}
+
+impl Ord for SiblingKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        
+        // YATA Rule 1: Compare right origins
+        // - Has right_origin (finite) comes BEFORE no right_origin (infinity)
+        // - For BTreeMap: smaller key = comes first, so finite < infinite
+        match (&self.right_origin, &other.right_origin) {
+            (Some(_), None) => return Ordering::Less,    // self comes first
+            (None, Some(_)) => return Ordering::Greater, // other comes first
+            (Some(self_ro), Some(other_ro)) => {
+                // YATA Rule 1b: Higher right_origin ID comes first
+                // For BTreeMap: higher ID = smaller key
+                match other_ro.cmp(self_ro) {
+                    Ordering::Less => return Ordering::Greater,
+                    Ordering::Greater => return Ordering::Less,
+                    Ordering::Equal => {}
+                }
+            }
+            (None, None) => {}
+        }
+        
+        // YATA Rule 2: Tiebreaker by (user, seq) - higher comes first
+        // For BTreeMap: higher (user, seq) = smaller key
+        let self_key = (self.user_idx, self.seq);
+        let other_key = (other.user_idx, other.seq);
+        other_key.cmp(&self_key)
+    }
+}
+
+impl PartialOrd for SiblingKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+
 
 /// A compact span of consecutive items inserted by the same user (30 bytes).
 /// 
@@ -471,6 +537,11 @@ pub struct Rga {
     /// Maps the FIRST seq of each span to its index.
     /// When spans are split, new entries are added.
     id_index: FxHashMap<(u16, u32), usize>,
+    /// Index from left_origin to siblings sorted by YATA order.
+    /// Maps (origin_user_idx, origin_seq) -> BTreeMap<SiblingKey, (user_idx, seq)>.
+    /// Stores item IDs instead of span indices to avoid index invalidation.
+    /// This enables O(log k) conflict resolution instead of O(k) linear scan.
+    sibling_index: FxHashMap<(u16, u32), BTreeMap<SiblingKey, (u16, u32)>>,
 }
 
 impl Rga {
@@ -483,6 +554,7 @@ impl Rga {
             cursor_cache: CursorCache::new(),
             lamport: 0,
             id_index: FxHashMap::default(),
+            sibling_index: FxHashMap::default(),
         };
     }
 
@@ -1394,6 +1466,14 @@ impl Rga {
     /// Scans right from the origin, comparing with siblings using YATA rules.
     /// Skips descendants of siblings we pass over.
     /// Returns the index where the new span should be inserted.
+    /// Find insertion position when the new span has a left origin.
+    ///
+    /// Uses a hybrid approach:
+    /// - For few siblings (< threshold): linear scan with YATA comparison
+    /// - For many siblings (>= threshold): use sibling index for O(log k) lookup
+    ///
+    /// This optimizes for the common case (sequential editing with few conflicts)
+    /// while still providing O(log k) for adversarial cases with many conflicts.
     fn find_position_with_origin(
         &mut self,
         origin_id: &ItemId,
@@ -1407,7 +1487,7 @@ impl Rga {
             Some(idx) => idx,
             None => return self.spans.len(), // Origin not found, insert at end
         };
-        
+
         // Split origin span if needed
         let origin_span = self.spans.get(origin_idx).unwrap();
         let offset_in_span = (origin_id.seq as u32) - origin_span.seq;
@@ -1417,36 +1497,104 @@ impl Rga {
             self.spans.insert(origin_idx, existing, existing.visible_len() as u64);
             self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
         }
-        
+
         let mut pos = origin_idx + 1;
-        
-        // Fast path: check if we can exit immediately without YATA scan
+
+        // Fast path: check if we can exit immediately without sibling scan
         if pos >= self.spans.len() {
             return pos;
         }
-        
+
         let other = self.spans.get(pos).unwrap();
         if !other.has_origin() {
             return pos;
         }
-        
+
         let other_origin = other.origin();
         let other_origin_user = self.users.get_key(other_origin.user_idx);
         if other_origin_user != Some(&origin_id.user) || other_origin.seq as u64 != origin_id.seq {
             return pos;
         }
-        
-        // Slow path: need full YATA scan with subtree tracking
+
+        // At this point we have at least one sibling - check if we should use the index
         let origin_user_idx = self.ensure_user(&origin_id.user);
+        let origin_key = (origin_user_idx, origin_id.seq as u32);
+        
+        // Threshold: only use sibling index if there are many siblings
+        // For few siblings, linear scan is faster due to lower constant factors
+        const SIBLING_INDEX_THRESHOLD: usize = 8;
+        
+        // Check if sibling index exists and is populated
+        let sibling_count = self.sibling_index
+            .get(&origin_key)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        
+        // If we have siblings but no index yet, count actual siblings by scanning
+        // and populate the index if count exceeds threshold
+        let use_index = if sibling_count >= SIBLING_INDEX_THRESHOLD {
+            true
+        } else if sibling_count == 0 {
+            // No index - count siblings by scanning and maybe populate
+            let mut actual_count = 0;
+            let mut scan_pos = pos;
+            while scan_pos < self.spans.len() {
+                let s = self.spans.get(scan_pos).unwrap();
+                if self.is_sibling(s, origin_id.user, origin_id.seq) {
+                    actual_count += 1;
+                    if actual_count >= SIBLING_INDEX_THRESHOLD {
+                        // Populate the index
+                        self.populate_sibling_index(origin_key, origin_idx);
+                        break;
+                    }
+                }
+                scan_pos += 1;
+            }
+            actual_count >= SIBLING_INDEX_THRESHOLD
+        } else {
+            false
+        };
+        
+        if use_index {
+            // Use sibling index for O(log k) conflict resolution
+            let new_span_user_idx = self.users.get(&span_user).unwrap_or_else(|| {
+                self.users.get_or_insert(&span_user)
+            });
+            let new_right_origin = if span_has_right_origin {
+                Some((span_right_origin.user_idx, span_right_origin.seq))
+            } else {
+                None
+            };
+            let new_key = SiblingKey::new(new_right_origin, new_span_user_idx, span_seq);
+
+            if let Some(siblings) = self.sibling_index.get(&origin_key) {
+                let mut insert_after_idx = origin_idx;
+
+                for (_sibling_key, &(sibling_user_idx, sibling_seq)) in siblings.range(..new_key) {
+                    let sibling_id = ItemId {
+                        user: *self.users.get_key(sibling_user_idx).unwrap(),
+                        seq: sibling_seq as u64,
+                    };
+                    if let Some(sibling_span_idx) = self.find_span_by_id(&sibling_id) {
+                        let subtree_end = self.skip_subtree(sibling_span_idx);
+                        if subtree_end > insert_after_idx + 1 {
+                            insert_after_idx = subtree_end - 1;
+                        }
+                    }
+                }
+
+                return insert_after_idx + 1;
+            }
+        }
+        
+        // Linear scan for few siblings (common case)
         let mut subtree_ranges: SmallVec<[(u16, u32, u32); 8]> = SmallVec::new();
         subtree_ranges.push((origin_user_idx, origin_id.seq as u32, origin_id.seq as u32));
-        
+
         while pos < self.spans.len() {
             let other = self.spans.get(pos).unwrap();
-            
-            // Check if this span is a sibling
+
             if !self.is_sibling(other, origin_id.user, origin_id.seq) {
-                // Not a sibling - check if it's a descendant
                 if other.has_origin() {
                     let other_origin = other.origin();
                     if Self::origin_in_subtree(other_origin, &subtree_ranges) {
@@ -1455,11 +1603,9 @@ impl Rga {
                         continue;
                     }
                 }
-                // Not in subtree - we've exited
                 break;
             }
-            
-            // It's a sibling - use YATA comparison
+
             let order = self.yata_compare(
                 span_right_origin,
                 span_has_right_origin,
@@ -1467,7 +1613,7 @@ impl Rga {
                 span_seq,
                 other,
             );
-            
+
             match order {
                 YataOrder::Before => break,
                 YataOrder::After => {
@@ -1476,7 +1622,7 @@ impl Rga {
                 }
             }
         }
-        
+
         pos
     }
 
@@ -1592,6 +1738,133 @@ impl Rga {
         
         pos
     }
+    
+    // =========================================================================
+    // Sibling Index Helpers
+    // =========================================================================
+    
+    /// Add a span to the sibling index.
+    /// Call this after inserting a span into self.spans.
+    /// 
+    /// Uses lazy population: only adds to the index if there are already
+    /// siblings indexed. This avoids overhead for the common case of
+    /// sequential editing with no conflicts.
+    fn add_to_sibling_index(&mut self, span: &Span, _span_idx: usize) {
+        if !span.has_origin() {
+            // Root-level spans don't have siblings (they use find_position_at_root)
+            return;
+        }
+        
+        let origin = span.origin();
+        let origin_key = (origin.user_idx, origin.seq);
+        
+        // Lazy population: only add if there's already an entry for this origin
+        // This avoids overhead for the common case of sequential editing
+        if !self.sibling_index.contains_key(&origin_key) {
+            return;
+        }
+        
+        let right_origin = if span.has_right_origin() {
+            let ro = span.right_origin();
+            Some((ro.user_idx, ro.seq))
+        } else {
+            None
+        };
+        
+        let sibling_key = SiblingKey::new(right_origin, span.user_idx, span.seq);
+        let span_id = (span.user_idx, span.seq);
+        
+        self.sibling_index
+            .get_mut(&origin_key)
+            .unwrap()
+            .insert(sibling_key, span_id);
+    }
+    
+    /// Remove a span from the sibling index.
+
+    /// Populate the sibling index for a specific origin.
+    /// Called when we first detect many siblings at an origin point.
+    fn populate_sibling_index(&mut self, origin_key: (u16, u32), origin_idx: usize) {
+        let mut siblings = BTreeMap::new();
+        
+        // Scan from after origin to find all siblings
+        let mut pos = origin_idx + 1;
+        while pos < self.spans.len() {
+            let span = self.spans.get(pos).unwrap();
+            if !span.has_origin() {
+                break;
+            }
+            
+            let span_origin = span.origin();
+            if span_origin.user_idx == origin_key.0 && span_origin.seq == origin_key.1 {
+                // This is a sibling
+                let right_origin = if span.has_right_origin() {
+                    let ro = span.right_origin();
+                    Some((ro.user_idx, ro.seq))
+                } else {
+                    None
+                };
+                
+                let sibling_key = SiblingKey::new(right_origin, span.user_idx, span.seq);
+                let span_id = (span.user_idx, span.seq);
+                siblings.insert(sibling_key, span_id);
+            }
+            
+            pos += 1;
+        }
+        
+        self.sibling_index.insert(origin_key, siblings);
+    }
+
+    fn remove_from_sibling_index(&mut self, span: &Span) {
+        if !span.has_origin() {
+            return;
+        }
+        
+        let origin = span.origin();
+        let origin_key = (origin.user_idx, origin.seq);
+        
+        let right_origin = if span.has_right_origin() {
+            let ro = span.right_origin();
+            Some((ro.user_idx, ro.seq))
+        } else {
+            None
+        };
+        
+        let sibling_key = SiblingKey::new(right_origin, span.user_idx, span.seq);
+        
+        if let Some(siblings) = self.sibling_index.get_mut(&origin_key) {
+            siblings.remove(&sibling_key);
+            // Don't remove empty entries - they might be reused
+        }
+    }
+    
+    /// Rebuild the sibling index from scratch.
+    /// Call this after bulk operations like merge.
+    fn rebuild_sibling_index(&mut self) {
+        self.sibling_index.clear();
+        for span in self.spans.iter() {
+            if span.has_origin() {
+                let origin = span.origin();
+                let origin_key = (origin.user_idx, origin.seq);
+                
+                let right_origin = if span.has_right_origin() {
+                    let ro = span.right_origin();
+                    Some((ro.user_idx, ro.seq))
+                } else {
+                    None
+                };
+                
+                let sibling_key = SiblingKey::new(right_origin, span.user_idx, span.seq);
+                let span_id = (span.user_idx, span.seq);
+                
+                self.sibling_index
+                    .entry(origin_key)
+                    .or_insert_with(BTreeMap::new)
+                    .insert(sibling_key, span_id);
+            }
+        }
+    }
 
     /// Insert a span using YATA/FugueMax ordering rules with dual origins.
     /// 
@@ -1655,6 +1928,9 @@ impl Rga {
         };
 
         self.spans.insert(insert_idx, span, span_len);
+        
+        // Update sibling index
+        self.add_to_sibling_index(&span, insert_idx);
     }
 
     /// Insert a span with a hint for the origin position.
@@ -1694,6 +1970,9 @@ impl Rga {
         );
 
         self.spans.insert(insert_idx, span, span_len);
+        
+        // Update sibling index
+        self.add_to_sibling_index(&span, insert_idx);
     }
 
     /// Find insertion position using a hint for the origin index.
@@ -2327,6 +2606,9 @@ impl super::Crdt for Rga {
         
         // Invalidate cursor cache since we modified the structure
         self.cursor_cache.invalidate();
+        
+        // Rebuild sibling index to fix span indices after all insertions
+        self.rebuild_sibling_index();
     }
 }
 
