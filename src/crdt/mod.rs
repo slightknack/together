@@ -10,6 +10,7 @@ pub mod op;
 pub mod primitives;
 pub mod rga;
 pub mod rga_trait;
+pub mod yjs;
 
 /// A CRDT is a data type with a merge operator that is commutative,
 /// associative, and idempotent.

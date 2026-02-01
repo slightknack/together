@@ -578,28 +578,25 @@ macro_rules! run_conformance_tests {
 }
 
 // =============================================================================
-// Tests for implementations will be added as they are created
+// Tests for implementations
 // =============================================================================
 
-// Example of how to use the macro (commented out until we have implementations):
-//
-// use together::crdt::diamond_types::DiamondRga;
-// use together::key::KeyPair;
-//
-// fn make_diamond_rga() -> DiamondRga {
-//     DiamondRga::new()
-// }
-//
-// lazy_static! {
-//     static ref USER1: KeyPub = KeyPair::generate().key_pub;
-//     static ref USER2: KeyPub = KeyPair::generate().key_pub;
-//     static ref USER3: KeyPub = KeyPair::generate().key_pub;
-// }
-//
-// run_conformance_tests!(
-//     diamond_types,
-//     make_diamond_rga,
-//     USER1.clone(),
-//     USER2.clone(),
-//     USER3.clone()
-// );
+use together::crdt::yjs::YjsRga;
+use together::key::KeyPair;
+use together::key::KeyPub;
+
+fn make_yjs_rga() -> YjsRga {
+    return YjsRga::new();
+}
+
+fn make_user() -> KeyPub {
+    return KeyPair::generate().key_pub;
+}
+
+run_conformance_tests!(
+    yjs_rga,
+    make_yjs_rga,
+    make_user(),
+    make_user(),
+    make_user()
+);
