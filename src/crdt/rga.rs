@@ -31,7 +31,7 @@ use crate::key::KeyPub;
 use super::btree_list::BTreeList;
 
 /// Sentinel value indicating no origin (insert at beginning).
-const NO_ORIGIN: u32 = u32::MAX;
+const NO_ORIGIN_USER: u16 = u16::MAX;
 
 /// A table mapping u16 indices to KeyPub values.
 /// This allows spans to store a 2-byte index instead of a 32-byte key.
@@ -157,38 +157,53 @@ impl PartialEq for Version {
 
 impl Eq for Version {}
 
-/// A compact reference to an origin position.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OriginRef {
-    span_idx: u32,
-    offset: u32,
+/// A compact reference to an origin item by its unique ID.
+/// 
+/// Uses (user_idx, seq) which is stable across document modifications.
+/// This enables the origin index optimization: we can map from origin ID
+/// to the list of spans that share that origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct OriginId {
+    /// User index of the origin character (NO_ORIGIN_USER if no origin).
+    user_idx: u16,
+    /// Sequence number of the origin character.
+    seq: u32,
 }
 
-impl OriginRef {
-    fn none() -> OriginRef {
-        return OriginRef {
-            span_idx: NO_ORIGIN,
-            offset: 0,
+impl OriginId {
+    fn none() -> OriginId {
+        return OriginId {
+            user_idx: NO_ORIGIN_USER,
+            seq: 0,
         };
     }
 
-    fn some(span_idx: u32, offset: u32) -> OriginRef {
-        return OriginRef { span_idx, offset };
+    fn some(user_idx: u16, seq: u32) -> OriginId {
+        return OriginId { user_idx, seq };
+    }
+    
+    /// Convert to a key for the origin index.
+    fn as_key(&self) -> (u16, u32) {
+        return (self.user_idx, self.seq);
     }
 }
 
-/// A compact span of consecutive items inserted by the same user (24 bytes).
+/// A compact span of consecutive items inserted by the same user.
+/// 
+/// Origin is stored as (user_idx, seq) which is stable across modifications.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct Span {
     seq: u32,
     len: u32,
-    origin_span_idx: u32,
-    origin_offset: u32,
+    /// Origin user index (NO_ORIGIN_USER if no origin).
+    origin_user_idx: u16,
+    /// Origin sequence number.
+    origin_seq: u32,
     content_offset: u32,
     user_idx: u16,
     deleted: bool,
-    _padding: u8,
+    _padding: [u8; 1],
 }
 
 impl Span {
@@ -196,36 +211,36 @@ impl Span {
         user_idx: u16,
         seq: u32,
         len: u32,
-        origin: OriginRef,
+        origin: OriginId,
         content_offset: u32,
     ) -> Span {
         return Span {
             seq,
             len,
-            origin_span_idx: origin.span_idx,
-            origin_offset: origin.offset,
+            origin_user_idx: origin.user_idx,
+            origin_seq: origin.seq,
             content_offset,
             user_idx,
             deleted: false,
-            _padding: 0,
+            _padding: [0; 1],
         };
     }
 
-    fn origin(&self) -> OriginRef {
-        return OriginRef {
-            span_idx: self.origin_span_idx,
-            offset: self.origin_offset,
+    fn origin(&self) -> OriginId {
+        return OriginId {
+            user_idx: self.origin_user_idx,
+            seq: self.origin_seq,
         };
     }
 
-    fn set_origin(&mut self, origin: OriginRef) {
-        self.origin_span_idx = origin.span_idx;
-        self.origin_offset = origin.offset;
+    fn set_origin(&mut self, origin: OriginId) {
+        self.origin_user_idx = origin.user_idx;
+        self.origin_seq = origin.seq;
     }
 
     #[inline(always)]
     fn has_origin(&self) -> bool {
-        return self.origin_span_idx != NO_ORIGIN;
+        return self.origin_user_idx != NO_ORIGIN_USER;
     }
 
     #[inline(always)]
@@ -233,18 +248,21 @@ impl Span {
         return seq >= self.seq && seq < self.seq + self.len;
     }
 
+    /// Split this span at the given offset, returning the right part.
+    /// The right part's origin is set to the last character of the left part.
     #[inline]
     fn split(&mut self, offset: u32) -> Span {
         debug_assert!(offset > 0 && offset < self.len);
+        // The right part's origin is the character just before the split
         let right = Span {
             seq: self.seq + offset,
             len: self.len - offset,
-            origin_span_idx: NO_ORIGIN, // Will be fixed by caller
-            origin_offset: 0,
+            origin_user_idx: self.user_idx,
+            origin_seq: self.seq + offset - 1,
             content_offset: self.content_offset + offset,
             user_idx: self.user_idx,
             deleted: self.deleted,
-            _padding: 0,
+            _padding: [0; 1],
         };
         self.len = offset;
         return right;
@@ -376,6 +394,9 @@ pub struct Rga {
     cursor_cache: CursorCache,
     /// Lamport timestamp for versioning.
     lamport: u64,
+    /// Index from origin ID to list of span indices with that origin.
+    /// Enables O(k) sibling lookup instead of O(n) scan.
+    origin_index: FxHashMap<(u16, u32), SmallVec<[usize; 4]>>,
 }
 
 impl Rga {
@@ -387,6 +408,7 @@ impl Rga {
             users: UserTable::new(),
             cursor_cache: CursorCache::new(),
             lamport: 0,
+            origin_index: FxHashMap::default(),
         };
     }
 
@@ -442,7 +464,7 @@ impl Rga {
             user_idx,
             seq,
             content.len() as u32,
-            OriginRef::none(),
+            OriginId::none(),
             content_offset,
         );
 
@@ -921,7 +943,9 @@ impl Rga {
         let prev_visible_len = prev_span.visible_len() as u64;
         
         // Set the origin from the lookup we just did
-        span.set_origin(OriginRef::some(prev_idx as u32, offset_in_prev as u32));
+        // Origin is (user_idx, seq) of the character we are inserting after
+        let origin_seq = prev_span.seq + offset_in_prev as u32;
+        span.set_origin(OriginId::some(prev_span.user_idx, origin_seq));
 
         // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted
         // Also check offset_in_prev == prev_span.visible_len - 1 to ensure we're at the end of the span
@@ -1048,7 +1072,7 @@ impl Rga {
                     user_idx,
                     *seq as u32,
                     *len as u32,
-                    OriginRef::none(), // Will be resolved during insert
+                    OriginId::none(), // Will be resolved during insert
                     content_offset,
                 );
 
@@ -1062,8 +1086,11 @@ impl Rga {
         }
     }
 
-    /// Insert a span using RGA ordering rules.
-    /// When multiple spans have the same origin, order by (user, seq) descending.
+    /// Insert a span using RGA ordering rules with origin index optimization.
+    /// 
+    /// When multiple spans share the same origin (siblings), we use the origin_index
+    /// to find them in O(k) time instead of O(n) scan. Among siblings, we order by
+    /// (user, seq) descending for deterministic conflict resolution.
     fn insert_span_rga(&mut self, mut span: Span, origin: Option<ItemId>) {
         let span_len = span.visible_len() as u64;
 
@@ -1073,13 +1100,17 @@ impl Rga {
         }
 
         let insert_idx = if let Some(ref origin_id) = origin {
-            // Find the origin span
+            // Convert origin to stable (user_idx, seq)
+            let origin_user_idx = self.ensure_user(&origin_id.user);
+            let origin_seq = origin_id.seq as u32;
+            
+            // Set the origin using stable identifiers
+            span.set_origin(OriginId::some(origin_user_idx, origin_seq));
+            
+            // Find the origin span to determine base insert position
             if let Some(origin_idx) = self.find_span_by_id(origin_id) {
                 let origin_span = self.spans.get(origin_idx).unwrap();
-                let offset_in_span = (origin_id.seq as u32) - origin_span.seq;
-
-                // Set the origin reference
-                span.set_origin(OriginRef::some(origin_idx as u32, offset_in_span));
+                let offset_in_span = origin_seq - origin_span.seq;
 
                 // If origin is in the middle of a span, split it
                 if offset_in_span < origin_span.len - 1 {
@@ -1089,27 +1120,62 @@ impl Rga {
                     self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
                 }
 
-                // Insert after origin, respecting RGA ordering
-                let mut pos = origin_idx + 1;
+                // ORIGIN INDEX OPTIMIZATION:
+                // Use the origin index to find siblings with the same origin.
+                // This is O(k) where k = number of concurrent edits at same position,
+                // instead of O(n) linear scan.
+                let origin_key = (origin_user_idx, origin_seq);
+                let sibling_indices: SmallVec<[usize; 4]> = self.origin_index
+                    .get(&origin_key)
+                    .cloned()
+                    .unwrap_or_default();
+                
+                // Find correct position among siblings using RGA ordering
                 let span_user = self.users.get_key(span.user_idx).unwrap();
+                let mut insert_pos = origin_idx + 1;
+                
+                // Check siblings from the index
+                for &sibling_idx in &sibling_indices {
+                    if sibling_idx >= self.spans.len() {
+                        continue; // Stale index entry
+                    }
+                    let sibling = self.spans.get(sibling_idx).unwrap();
+                    if !sibling.has_origin() {
+                        continue;
+                    }
+                    let sibling_origin = sibling.origin();
+                    if sibling_origin.user_idx != origin_user_idx || sibling_origin.seq != origin_seq {
+                        continue; // Not actually a sibling
+                    }
+                    
+                    // RGA ordering: higher (user, seq) comes first
+                    let sibling_user = self.users.get_key(sibling.user_idx).unwrap();
+                    if (sibling_user, sibling.seq) > (span_user, span.seq) {
+                        if sibling_idx + 1 > insert_pos {
+                            insert_pos = sibling_idx + 1;
+                        }
+                    }
+                }
+                
+                // Also scan from origin+1 for correctness (catches unindexed siblings)
+                let mut pos = origin_idx + 1;
                 while pos < self.spans.len() {
                     let other = self.spans.get(pos).unwrap();
-                    // Check if other has the same origin
                     if other.has_origin() {
                         let other_origin = other.origin();
-                        if other_origin.span_idx == origin_idx as u32 
-                            && other_origin.offset == offset_in_span 
-                        {
+                        if other_origin.user_idx == origin_user_idx && other_origin.seq == origin_seq {
                             let other_user = self.users.get_key(other.user_idx).unwrap();
                             if (other_user, other.seq) > (span_user, span.seq) {
                                 pos += 1;
+                                insert_pos = insert_pos.max(pos);
                                 continue;
                             }
                         }
                     }
                     break;
                 }
-                pos
+                
+                insert_pos
             } else {
                 self.spans.len()
             }
@@ -1131,10 +1197,34 @@ impl Rga {
             pos
         };
 
+        // Insert the span
         self.spans.insert(insert_idx, span, span_len);
+        
+        // Update the origin index
+        if span.has_origin() {
+            let origin_key = span.origin().as_key();
+            self.origin_index
+                .entry(origin_key)
+                .or_insert_with(SmallVec::new)
+                .push(insert_idx);
+        }
+    }
+    
+    /// Rebuild the origin index from scratch.
+    /// Call this after operations that may have invalidated span indices.
+    fn rebuild_origin_index(&mut self) {
+        self.origin_index.clear();
+        for (idx, span) in self.spans.iter().enumerate() {
+            if span.has_origin() {
+                let origin_key = span.origin().as_key();
+                self.origin_index
+                    .entry(origin_key)
+                    .or_insert_with(SmallVec::new)
+                    .push(idx);
+            }
+        }
     }
 
-    /// Delete a single item by its ID.
     fn delete_by_id(&mut self, id: &ItemId) -> bool {
         let idx = match self.find_span_by_id(id) {
             Some(i) => i,
@@ -1424,14 +1514,13 @@ impl super::Crdt for Rga {
             let content = &other_column.content
                 [span.content_offset as usize..(span.content_offset + span.len) as usize];
 
-            // Reconstruct the origin ItemId if present
+            // Get the origin from the span's stored (user_idx, seq)
             let origin = if span.has_origin() {
-                let origin_ref = span.origin();
-                let origin_span = other.spans.get(origin_ref.span_idx as usize).unwrap();
-                let origin_user = other.users.get_key(origin_span.user_idx).unwrap();
+                let origin_id = span.origin();
+                let origin_user = other.users.get_key(origin_id.user_idx).unwrap();
                 Some(OpItemId {
                     user: *origin_user,
-                    seq: (origin_span.seq + origin_ref.offset) as u64,
+                    seq: origin_id.seq as u64,
                 })
             } else {
                 None
