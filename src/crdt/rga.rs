@@ -352,6 +352,29 @@ impl Column {
             next_seq: 0,
         };
     }
+    
+    /// Check if a sequence number has been seen (item exists).
+    #[inline]
+    fn has_seq(&self, seq: u32) -> bool {
+        seq < self.next_seq
+    }
+    
+    /// Find the first missing seq in a range [start, start+len).
+    /// Returns None if all seqs exist, Some(offset) for first missing.
+    #[inline]
+    fn first_missing_in_range(&self, start: u32, len: u32) -> Option<u32> {
+        if start >= self.next_seq {
+            // All items are missing, first missing is at offset 0
+            return Some(0);
+        }
+        if start + len <= self.next_seq {
+            // All items exist
+            return None;
+        }
+        // Some items exist, some don't
+        // next_seq is the first missing seq
+        Some(self.next_seq - start)
+    }
 }
 
 /// Cursor cache for amortizing sequential lookups.
@@ -444,6 +467,10 @@ pub struct Rga {
     cursor_cache: CursorCache,
     /// Lamport timestamp for versioning.
     lamport: u64,
+    /// Index from (user_idx, seq) to span index for O(1) ID lookup.
+    /// Maps the FIRST seq of each span to its index.
+    /// When spans are split, new entries are added.
+    id_index: FxHashMap<(u16, u32), usize>,
 }
 
 impl Rga {
@@ -455,6 +482,7 @@ impl Rga {
             users: UserTable::new(),
             cursor_cache: CursorCache::new(),
             lamport: 0,
+            id_index: FxHashMap::default(),
         };
     }
 
@@ -1102,19 +1130,83 @@ impl Rga {
         })
     }
 
-    /// Find span containing the given ItemId using linear search.
+    /// Find span containing the given ItemId using the ID index.
+    /// Falls back to linear search if index doesn't have the entry.
     fn find_span_by_id(&self, id: &ItemId) -> Option<usize> {
         let user_idx = match self.users.get(&id.user) {
             Some(idx) => idx,
             None => return None,
         };
         let seq = id.seq as u32;
+        
+        // Try index lookup first - find the span that could contain this seq
+        // The index maps span start seq -> index, so we need to find the
+        // largest start_seq <= seq for this user
+        if let Some(&idx) = self.id_index.get(&(user_idx, seq)) {
+            // Direct hit - seq is at span start
+            let span = self.spans.get(idx)?;
+            if span.user_idx == user_idx && span.contains_seq(seq) {
+                return Some(idx);
+            }
+        }
+        
+        // Fallback to linear search for items not at span start
+        // This handles the case where seq is in the middle of a span
         for (i, span) in self.spans.iter().enumerate() {
             if span.user_idx == user_idx && span.contains_seq(seq) {
                 return Some(i);
             }
         }
         return None;
+    }
+    
+    /// Update the ID index after inserting a span at the given index.
+    fn update_index_after_insert(&mut self, idx: usize) {
+        // Update indices for all spans after the insertion point
+        let keys_to_update: Vec<(u16, u32)> = self.id_index
+            .iter()
+            .filter(|&(_, &v)| v >= idx)
+            .map(|(&k, _)| k)
+            .collect();
+        
+        for key in keys_to_update {
+            if let Some(v) = self.id_index.get_mut(&key) {
+                *v += 1;
+            }
+        }
+        
+        // Add the new span to the index
+        if let Some(span) = self.spans.get(idx) {
+            self.id_index.insert((span.user_idx, span.seq), idx);
+        }
+    }
+    
+    /// Update the ID index after removing a span at the given index.
+    fn update_index_after_remove(&mut self, removed_user_idx: u16, removed_seq: u32, idx: usize) {
+        // Remove the old entry
+        self.id_index.remove(&(removed_user_idx, removed_seq));
+        
+        // Update indices for all spans after the removal point
+        let keys_to_update: Vec<(u16, u32)> = self.id_index
+            .iter()
+            .filter(|&(_, &v)| v > idx)
+            .map(|(&k, _)| k)
+            .collect();
+        
+        for key in keys_to_update {
+            if let Some(v) = self.id_index.get_mut(&key) {
+                *v -= 1;
+            }
+        }
+    }
+    
+    /// Rebuild the ID index from scratch.
+    /// Call this after bulk operations that may have invalidated the index.
+    fn rebuild_id_index(&mut self) {
+        self.id_index.clear();
+        for (i, span) in self.spans.iter().enumerate() {
+            self.id_index.insert((span.user_idx, span.seq), i);
+        }
     }
 
 }
@@ -1818,6 +1910,9 @@ impl Default for RgaBuf {
 
 impl super::Crdt for Rga {
     fn merge(&mut self, other: &Self) {
+        // Build the ID index for fast lookups during merge
+        self.rebuild_id_index();
+        
         // Merge spans from other into self.
         // 
         // IMPORTANT: We must process spans in topological (causal) order.
@@ -1845,21 +1940,33 @@ impl super::Crdt for Rga {
             let other_user = other.users.get_key(span.user_idx).unwrap();
             
             // Check which items from this span we already have.
-            // Spans can be extended by coalescing, so we need to find the first
-            // item that doesn't exist in self and insert from there.
+            // We need to find the first item that doesn't exist in self.
+            // 
+            // Optimization: first check if the span START exists. If not,
+            // the entire span is new. If yes, scan to find first missing.
+            let first_item_id = ItemId {
+                user: *other_user,
+                seq: span.seq as u64,
+            };
             
-            // Find the first seq in this span that doesn't exist in self
-            let mut first_missing_offset: Option<u32> = None;
-            for offset in 0..span.len {
-                let item_id = ItemId {
-                    user: *other_user,
-                    seq: (span.seq + offset) as u64,
-                };
-                if self.find_span_by_id(&item_id).is_none() {
-                    first_missing_offset = Some(offset);
-                    break;
+            let first_missing_offset = if self.find_span_by_id(&first_item_id).is_none() {
+                // First item doesn't exist - entire span is new
+                Some(0)
+            } else {
+                // First item exists - need to check the rest
+                let mut first_missing: Option<u32> = None;
+                for offset in 1..span.len {
+                    let item_id = ItemId {
+                        user: *other_user,
+                        seq: (span.seq + offset) as u64,
+                    };
+                    if self.find_span_by_id(&item_id).is_none() {
+                        first_missing = Some(offset);
+                        break;
+                    }
                 }
-            }
+                first_missing
+            };
             
             // If all items exist, handle deletions and skip
             if first_missing_offset.is_none() {
@@ -2039,6 +2146,9 @@ impl super::Crdt for Rga {
         // document maintain their document order when inserted.
         while !pending.is_empty() {
             let mut made_progress = false;
+            
+            // Rebuild the ID index before each round for fast origin lookups
+            self.rebuild_id_index();
             
             let mut i = 0;
             while i < pending.len() {

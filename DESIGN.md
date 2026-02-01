@@ -215,7 +215,7 @@ With all that background out of the way, we'll get into together and CRDTs. Toge
 
 These primitives are fully usable on both the web and natively, and are designed in a future-compatible manner (so we don't fix any one protocol or cryptosystem).
 
-## Uxamples
+## Examples
 
 Create a new identity:
 
@@ -224,3 +224,27 @@ let alice = KeyPair::generate();
 ```
 
 Create a new text document:
+
+---
+
+# Scratchpad
+
+Let's build out the log-based sync layer next. I want it to work for more than just RGAs. 
+
+Can you do research into hypercore, and merkle trees? read e.g. DESIGN. We have a 16-tree implemented in log. Does it implement signing like we need?
+
+A document is a set of logs. each key is a:
+
+- Reader
+- Writer
+- Admin
+
+Admin controls the set of readers/writers, there is always exactly one Admin. Messages published to a log can be operations to apply to a crdt or meta. Any reader etc can fork the document; admin can transfer ownership by sending a terminal message that identifies a specific fork as the legitimate new Admin.
+
+Each log message contains a vector clock of the other branches. I'll say that if another log hasn't changed then there's no need to include it in the vector clock, it's implicitly the same.
+
+There should be two functions: one that performs an topological iteration over all events across all branches, and another that returns the last consistent branch (e.g. if you were to take the transitive closure over the logical clock of the current branch, what is the most recent clock in each branch reached, and which is the oldest? all events before whichever clock that is are guaranteed to be ordered
+
+All events should be signed, verified, etc.
+
+I wonder if we took the wrong approach with the crdt? if we can topologically sort events, we can just use some arbitrary good merge algo and the result/replica will be eventually consistent?
