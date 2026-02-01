@@ -226,8 +226,12 @@ struct Span {
     right_origin_seq: u32,
     content_offset: u32,
     user_idx: u16,
+    /// Epoch identifier for epoch-based batching optimization.
+    /// Spans from different epochs can be ordered by epoch ID without YATA scan.
+    /// Lower epoch = inserted earlier = comes first in document order.
+    epoch: u32,
     deleted: bool,
-    _padding: u8,
+    _padding: [u8; 3],
 }
 
 impl Span {
@@ -238,6 +242,7 @@ impl Span {
         origin: OriginId,
         right_origin: OriginId,
         content_offset: u32,
+        epoch: u32,
     ) -> Span {
         return Span {
             seq,
@@ -248,8 +253,9 @@ impl Span {
             right_origin_seq: right_origin.seq,
             content_offset,
             user_idx,
+            epoch,
             deleted: false,
-            _padding: 0,
+            _padding: [0; 3],
         };
     }
 
@@ -311,6 +317,7 @@ impl Span {
         // The right part's left origin is the last character of the left part.
         // This is correct because within a span, seq N was inserted after seq N-1.
         // Both parts keep the original right_origin - it's an insertion-time property.
+        // Both parts keep the same epoch - they were created in the same editing session.
         let right = Span {
             seq: self.seq + offset,
             len: self.len - offset,
@@ -321,8 +328,9 @@ impl Span {
             right_origin_seq: self.right_origin_seq,
             content_offset: self.content_offset + offset,
             user_idx: self.user_idx,
+            epoch: self.epoch,
             deleted: self.deleted,
-            _padding: 0,
+            _padding: [0; 3],
         };
         // Left part keeps its original right_origin - don't change it!
         // The right_origin is an insertion-time property, not a document structure property.
@@ -471,6 +479,10 @@ pub struct Rga {
     /// Maps the FIRST seq of each span to its index.
     /// When spans are split, new entries are added.
     id_index: FxHashMap<(u16, u32), usize>,
+    /// Current epoch for new insertions.
+    /// Incremented on merge to create epoch boundaries.
+    /// Spans from different epochs can be ordered by epoch ID without YATA scan.
+    current_epoch: u32,
 }
 
 impl Rga {
@@ -483,6 +495,7 @@ impl Rga {
             cursor_cache: CursorCache::new(),
             lamport: 0,
             id_index: FxHashMap::default(),
+            current_epoch: 0,
         };
     }
 
@@ -570,6 +583,7 @@ impl Rga {
             OriginId::none(),
             OriginId::none(), // Will be set properly in Part 2
             content_offset,
+            self.current_epoch,
         );
 
         self.insert_span_at_pos_optimized(span, pos);
@@ -941,7 +955,7 @@ impl Rga {
     /// Attempts to coalesce with the preceding span if possible.
     /// Uses cursor caching for O(1) sequential typing with chunk location caching.
     #[inline]
-    fn insert_span_at_pos_optimized(&mut self, mut span: Span, pos: u64) {
+    fn insert_span_at_pos_optimized(&mut self, span: Span, pos: u64) {
         let span_len = span.visible_len() as u64;
         let doc_len = self.spans.total_weight();
 
@@ -1260,6 +1274,7 @@ impl Rga {
                 column.next_seq += *len as u32;
 
                 // Create the span
+                // Remote inserts use current_epoch - they will be compared with local spans
                 let span = Span::new(
                     user_idx,
                     *seq as u32,
@@ -1267,6 +1282,7 @@ impl Rga {
                     OriginId::none(), // Will be set during insert_span_rga
                     OriginId::none(), // Will be set during insert_span_rga
                     content_offset,
+                    self.current_epoch,
                 );
 
                 // Pass both origins to the YATA/FugueMax algorithm
@@ -1298,12 +1314,24 @@ impl Rga {
     /// 2. If right origins equal: higher (user, seq) comes FIRST
     fn yata_compare(
         &self,
+        new_epoch: u32,
         new_right_origin: OriginId,
         new_has_right_origin: bool,
         new_user: KeyPub,
         new_seq: u32,
         existing: &Span,
     ) -> YataOrder {
+        // EPOCH-BASED FAST PATH: Different epochs can be ordered deterministically
+        // Lower epoch = inserted earlier = comes first in document order
+        if new_epoch != existing.epoch {
+            if new_epoch < existing.epoch {
+                return YataOrder::Before;
+            } else {
+                return YataOrder::After;
+            }
+        }
+
+        // Same epoch: fall back to full YATA comparison
         let existing_has_ro = existing.has_right_origin();
         
         // Rule 1a: Compare null vs non-null right origin
@@ -1397,6 +1425,7 @@ impl Rga {
     fn find_position_with_origin(
         &mut self,
         origin_id: &ItemId,
+        span_epoch: u32,
         span_user: KeyPub,
         span_seq: u32,
         span_right_origin: OriginId,
@@ -1461,6 +1490,7 @@ impl Rga {
             
             // It's a sibling - use YATA comparison
             let order = self.yata_compare(
+                span_epoch,
                 span_right_origin,
                 span_has_right_origin,
                 span_user,
@@ -1487,6 +1517,7 @@ impl Rga {
     /// Returns the index where the new span should be inserted.
     fn find_position_at_root(
         &self,
+        span_epoch: u32,
         span_user: KeyPub,
         span_seq: u32,
         span_right_origin: OriginId,
@@ -1505,6 +1536,7 @@ impl Rga {
             
             // Root-level sibling - use YATA comparison
             let order = self.yata_compare(
+                span_epoch,
                 span_right_origin,
                 span_has_right_origin,
                 span_user,
@@ -1640,6 +1672,7 @@ impl Rga {
         let insert_idx = if let Some(ref origin_id) = left_origin {
             self.find_position_with_origin(
                 origin_id,
+                span.epoch,
                 span_user,
                 span.seq,
                 span_right_origin,
@@ -1647,6 +1680,7 @@ impl Rga {
             )
         } else {
             self.find_position_at_root(
+                span.epoch,
                 span_user,
                 span.seq,
                 span_right_origin,
@@ -1687,6 +1721,7 @@ impl Rga {
         let insert_idx = self.find_position_with_origin_hint(
             &left_origin,
             origin_idx_hint,
+            span.epoch,
             span_user,
             span.seq,
             span_right_origin,
@@ -1703,6 +1738,7 @@ impl Rga {
         &mut self,
         origin_id: &ItemId,
         origin_idx: usize,
+        span_epoch: u32,
         span_user: KeyPub,
         span_seq: u32,
         span_right_origin: OriginId,
@@ -1764,6 +1800,7 @@ impl Rga {
             
             // It's a sibling - use YATA comparison
             let order = self.yata_compare(
+                span_epoch,
                 span_right_origin,
                 span_has_right_origin,
                 span_user,
@@ -2266,6 +2303,7 @@ impl super::Crdt for Rga {
             };
 
             // Create a new span for just the missing items
+            // Preserve the epoch from the source span - this is critical for epoch-based ordering
             let mut new_span = Span::new(
                 user_idx,
                 missing_seq,
@@ -2273,6 +2311,7 @@ impl super::Crdt for Rga {
                 OriginId::none(),
                 OriginId::none(),
                 content_offset,
+                span.epoch,
             );
             new_span.deleted = span.deleted;
             
@@ -2337,8 +2376,8 @@ mod tests {
 
     #[test]
     fn span_size() {
-        // Verify our span is compact
-        // With dual origins (left + right), span is 30 bytes:
+        // Verify our span is reasonably compact
+        // With dual origins (left + right) and epoch:
         // - seq: u32 (4)
         // - len: u32 (4)
         // - origin_user_idx: u16 (2)
@@ -2347,11 +2386,12 @@ mod tests {
         // - right_origin_seq: u32 (4)
         // - content_offset: u32 (4)
         // - user_idx: u16 (2)
+        // - epoch: u32 (4) - for epoch-based batching optimization
         // - deleted: bool (1)
-        // - _padding: u8 (1)
-        // Total: 28 bytes, but with alignment may be 32
+        // - _padding: [u8; 3] (3)
+        // Total: 34 bytes, but with alignment may be 40
         let size = std::mem::size_of::<Span>();
-        assert!(size <= 32, "Span is {} bytes, expected <= 32", size);
+        assert!(size <= 40, "Span is {} bytes, expected <= 40", size);
     }
 
     #[test]
