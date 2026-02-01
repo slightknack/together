@@ -214,3 +214,13 @@ With all that background out of the way, we'll get into together and CRDTs. Toge
 - Rich CRDT primitives for building arbitrary authenticated collaborative objects.
 
 These primitives are fully usable on both the web and natively, and are designed in a future-compatible manner (so we don't fix any one protocol or cryptosystem).
+
+## Uxamples
+
+Create a new identity:
+
+```
+let alice = KeyPair::generate();
+```
+
+Create a new text document:

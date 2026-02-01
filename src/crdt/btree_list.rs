@@ -206,6 +206,7 @@ impl Node {
 }
 
 /// A weighted list implemented as a B-tree.
+#[derive(Clone)]
 pub struct BTreeList<T> {
     /// Leaf nodes.
     leaves: Vec<Leaf<T>>,
