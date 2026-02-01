@@ -48,9 +48,9 @@ impl TestData {
 
 fn main() {
     let traces = [
-        ("sveltecomponent", "data/editing-traces/sequential_traces/ascii_only/sveltecomponent.json.gz"),
-        ("rustcode", "data/editing-traces/sequential_traces/ascii_only/rustcode.json.gz"),
-        ("seph-blog1", "data/editing-traces/sequential_traces/ascii_only/seph-blog1.json.gz"),
+        ("sveltecomponent", "../../data/editing-traces/sequential_traces/ascii_only/sveltecomponent.json.gz"),
+        ("rustcode", "../../data/editing-traces/sequential_traces/ascii_only/rustcode.json.gz"),
+        ("seph-blog1", "../../data/editing-traces/sequential_traces/ascii_only/seph-blog1.json.gz"),
     ];
     
     println!("Running 100 iterations each for stable timing...\n");

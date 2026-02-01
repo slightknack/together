@@ -128,10 +128,10 @@ fn bench_traces(c: &mut Criterion) {
     // Use ascii_only variants to avoid unicode position issues
     // Start with smaller traces; automerge-paper has 260k patches which is slow
     let traces = [
-        ("sveltecomponent", "data/editing-traces/sequential_traces/ascii_only/sveltecomponent.json.gz"),
-        ("rustcode", "data/editing-traces/sequential_traces/ascii_only/rustcode.json.gz"),
-        ("seph-blog1", "data/editing-traces/sequential_traces/ascii_only/seph-blog1.json.gz"),
-        ("automerge-paper", "data/editing-traces/sequential_traces/ascii_only/automerge-paper.json.gz"),
+        ("sveltecomponent", "../../data/editing-traces/sequential_traces/ascii_only/sveltecomponent.json.gz"),
+        ("rustcode", "../../data/editing-traces/sequential_traces/ascii_only/rustcode.json.gz"),
+        ("seph-blog1", "../../data/editing-traces/sequential_traces/ascii_only/seph-blog1.json.gz"),
+        ("automerge-paper", "../../data/editing-traces/sequential_traces/ascii_only/automerge-paper.json.gz"),
     ];
 
     // Load all traces

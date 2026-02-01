@@ -13,24 +13,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
-criterion = "0.5"
-diamond-types = "1"
-flate2 = "1"
 proptest = "1.9.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[[bench]]
-name = "rga_trace"
-harness = false
-
-[[bench]]
-name = "quick_bench"
-harness = false
-
-[[bench]]
-name = "profile_bench"
-harness = false
 
 [[bench]]
 name = "version_bench"

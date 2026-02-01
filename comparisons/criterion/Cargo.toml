@@ -1,0 +1,28 @@
+[package]
+name = "together-vs-diamond"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+together = { path = "../.." }
+diamond-types = "1"
+criterion = "0.5"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "quick_bench"
+path = "quick_bench.rs"
+
+[[bin]]
+name = "profile_bench"
+path = "profile_bench.rs"
+
+[[bench]]
+name = "rga_trace"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
