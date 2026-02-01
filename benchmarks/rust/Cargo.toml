@@ -1,0 +1,27 @@
+[package]
+name = "bench-comparison"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench_all"
+path = "src/main.rs"
+
+[dependencies]
+# Trace loading
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+
+# CRDT libraries
+together = { path = "../.." }
+diamond-types = "1"
+automerge = "0.5"
+yrs = "0.21"
+loro = "1"
+cola-crdt = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
