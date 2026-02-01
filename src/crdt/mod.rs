@@ -6,6 +6,7 @@
 //! CRDT primitives for collaborative data structures.
 
 mod btree_list;
+pub mod cola;
 pub mod diamond;
 pub mod op;
 pub mod primitives;

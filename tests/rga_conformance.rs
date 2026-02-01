@@ -581,6 +581,7 @@ macro_rules! run_conformance_tests {
 // Tests for implementations
 // =============================================================================
 
+use together::crdt::cola::ColaRga;
 use together::crdt::diamond::DiamondRga;
 use together::crdt::yjs::YjsRga;
 use together::key::KeyPair;
@@ -592,6 +593,10 @@ fn make_yjs_rga() -> YjsRga {
 
 fn make_diamond_rga() -> DiamondRga {
     return DiamondRga::new();
+}
+
+fn make_cola_rga() -> ColaRga {
+    return ColaRga::new();
 }
 
 fn make_user() -> KeyPub {
@@ -609,6 +614,14 @@ run_conformance_tests!(
 run_conformance_tests!(
     diamond_rga,
     make_diamond_rga,
+    make_user(),
+    make_user(),
+    make_user()
+);
+
+run_conformance_tests!(
+    cola_rga,
+    make_cola_rga,
     make_user(),
     make_user(),
     make_user()
