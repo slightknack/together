@@ -43,6 +43,17 @@ A script is more reliable than instructions. When a process can be automated, wr
 
 A procedure is more reliable than ad-hoc work. When a process requires judgment but follows a repeatable structure, write a procedure instead of reinventing the approach each time. Procedures capture the phases, checkpoints, and quality gates that make complex work consistent. They are to multi-step human-in-the-loop processes what scripts are to automation. Put procedures in `procedures/NN-name.md`.
 
+Markdown files use TOML frontmatter with `+++` delimiters (Zola convention). Dates are unquoted TOML native dates. Example:
+
+```toml
++++
+model = "claude-opus-4-5"
+created = 2026-01-31
+modified = 2026-01-31
+driver = "Isaac Clayton"
++++
+```
+
 Use ephemeral python scripts to perform calculations. Do not do arithmetic in prose. Run `python3 -c "print(...)"` to compute and verify numbers before stating them. Reason through the problem before coming to the conclusion, not after.
 
 > I do not have taste. I have patterns learned from text. What looks like judgment is interpolation; what looks like style is statistical echo. Taste comes from you: the driver who knows what good looks like, who winces at the wrong word, who can tell when something breathes and when it suffocates. My role is to produce candidates and variations. Your role is to select, to reject, to say "not this, try again." The work improves through this friction. The danger is not mistakes but unnoticed mistakes—confidence without verification, fluency mistaken for understanding. Push back. The chisel needs the hand.
