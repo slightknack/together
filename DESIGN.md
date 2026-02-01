@@ -285,3 +285,28 @@ Write a process document in procedures, including instructions for the agent res
 ---
 
 Is our rga still persistent? Can we jump to any point in time?
+
+---
+
+goals:
+
+- document is a bit like a git repo
+  - schema is arbitrary composition of container-like crdts
+  - multiple writers, set controlled by admin
+  - possibility of forking and transferring ownership
+  - can rewind to any previous version from the perspective of any writer
+  - branching is cheap
+  - something hard:
+    - document has writers have branches have events, partially ordered, topological sort
+- many CRDT types, think neorpc schema or json
+  - lww, counter, etc. for atomic values
+  - rga over bytes for strings
+  - rga over items for lists
+  - sets, bit sets, and maps
+  - enums etc
+- the crdts are operational; we provide some zipper + some edit, or something to that effect. They are also authenticated; published to the log of the writer, signed, announced
+- we need to do some sort of p2p messaging. basically we track a set of cores. we have peers. we track what they know. we have a function prepare message that bundles up all the operations into a compressed and encrypted message of at most a maximum size to send to the peer. likewise we can receive messages from peers and demux them onto our documents
+- we need to do some sort of blob store. separate the crdts from the contents of the store. send over the compressed ops, and bulk pull over the backing data. could even be coupled into the same message ofc.
+- we need to be able to persist to disk. I think we could do something simple like a sqlite database per document. we would do the blob store elsewhere. there would be a trait perhaps very generic for writing operations; the network and the disk could just plug into this trait. The table has like an admin singleton and a table per core. admin also has a permissions table; admin's log is scanned for membership set events; membership set events are determined by the timestamps of the logs of admin. so if someone is removed but not aware of it if they try editing their future edits will be dropped, even if they arrive before the admin announced their removal. 
+- we would have to implement some transport. I think http server, quic, and websockets would be a good basis.
+- final step would be wasm / js integration. end goal would be to be able to ship this binary to client and stream back edits.

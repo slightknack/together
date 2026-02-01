@@ -206,8 +206,8 @@ impl Node {
 }
 
 /// A weighted list implemented as a B-tree.
-#[derive(Clone)]
-pub struct BTreeList<T> {
+#[derive(Clone, Debug)]
+pub struct BTreeList<T: std::fmt::Debug> {
     /// Leaf nodes.
     leaves: Vec<Leaf<T>>,
     /// Internal nodes.
@@ -226,7 +226,7 @@ pub struct BTreeList<T> {
     free_nodes: Vec<NodeIdx>,
 }
 
-impl<T: Clone> BTreeList<T> {
+impl<T: Clone + std::fmt::Debug> BTreeList<T> {
     pub fn new() -> BTreeList<T> {
         let mut leaves = Vec::new();
         leaves.push(Leaf::new());
@@ -710,14 +710,14 @@ impl<T: Clone> BTreeList<T> {
     }
 }
 
-impl<T: Clone> Default for BTreeList<T> {
+impl<T: Clone + std::fmt::Debug> Default for BTreeList<T> {
     fn default() -> Self {
         return Self::new();
     }
 }
 
 /// Iterator over BTreeList items.
-struct BTreeListIter<'a, T> {
+struct BTreeListIter<'a, T: std::fmt::Debug> {
     tree: &'a BTreeList<T>,
     /// Leaf indices in document order.
     leaf_order: Vec<LeafIdx>,
@@ -727,7 +727,7 @@ struct BTreeListIter<'a, T> {
     item_idx: usize,
 }
 
-impl<'a, T: Clone> Iterator for BTreeListIter<'a, T> {
+impl<'a, T: Clone + std::fmt::Debug> Iterator for BTreeListIter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
