@@ -1,9 +1,22 @@
 // model = "claude-opus-4-5"
 // created = "2026-01-30"
-// modified = "2026-01-31"
+// modified = "2026-02-01"
 // driver = "Isaac Clayton"
 
 //! Replicated Growable Array (RGA) - a sequence CRDT for collaborative text editing.
+//!
+//! RGA maintains a total order over all inserted characters, even when edits happen
+//! concurrently on different replicas. Each character gets a unique ID (user, seq),
+//! and the ordering algorithm ensures all replicas converge to the same document.
+//!
+//! # Key concepts
+//!
+//! - **Span**: A contiguous run of characters from the same user. Spans are the unit
+//!   of storage; individual characters are not stored separately.
+//! - **Origin**: Each span knows which character it was inserted after. This enables
+//!   deterministic ordering of concurrent insertions at the same position.
+//! - **Tombstone deletion**: Deleted characters are marked as deleted but not removed,
+//!   preserving the total order for future merges.
 //!
 //! # Example
 //!
@@ -30,7 +43,8 @@ use smallvec::SmallVec;
 use crate::key::KeyPub;
 use super::btree_list::BTreeList;
 
-/// Sentinel value indicating no origin (insert at beginning).
+/// Sentinel value for spans with no origin (i.e., inserted at the document beginning).
+/// We use u16::MAX because valid user indices start at 0 and grow upward.
 const NO_ORIGIN_USER: u16 = u16::MAX;
 
 /// A table mapping u16 indices to KeyPub values.
@@ -69,10 +83,13 @@ impl UserTable {
     fn get_key(&self, idx: u16) -> Option<&KeyPub> {
         return self.idx_to_key.get(idx as usize);
     }
-
 }
 
-/// A unique identifier for an item in the RGA.
+/// A unique identifier for an item (character) in the RGA.
+///
+/// Each character inserted into the document gets a unique ItemId based on
+/// who inserted it (user) and when in their personal sequence (seq).
+/// This ID is stable across all replicas and survives merges.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ItemId {
     user: KeyPub,
@@ -159,9 +176,14 @@ impl Eq for Version {}
 
 /// A compact reference to an origin item by its unique ID.
 /// 
+/// The origin is the character that a span was inserted immediately after.
+/// For example, if you type "world" after "hello", the origin of "world"
+/// is the 'o' in "hello".
+///
 /// Uses (user_idx, seq) which is stable across document modifications.
 /// This enables the origin index optimization: we can map from origin ID
-/// to the list of spans that share that origin.
+/// to the list of spans that share that origin (siblings inserted at
+/// the same position concurrently).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct OriginId {
     /// User index of the origin character (NO_ORIGIN_USER if no origin).
@@ -188,21 +210,36 @@ impl OriginId {
     }
 }
 
-/// A compact span of consecutive items inserted by the same user.
+/// A compact span of consecutive characters inserted by the same user.
 /// 
+/// Spans are the fundamental unit of storage in RGA. Rather than storing
+/// each character individually (which would be expensive), we group
+/// consecutive characters from the same user into spans.
+///
+/// A span can be split when:
+/// - A concurrent insert lands in the middle of the span
+/// - A delete operation targets part of the span
+///
 /// Origin is stored as (user_idx, seq) which is stable across modifications.
+/// The origin identifies which character this span was inserted after.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct Span {
+    /// Starting sequence number for this span's characters.
     seq: u32,
+    /// Number of characters in this span.
     len: u32,
-    /// Origin user index (NO_ORIGIN_USER if no origin).
+    /// Origin user index (NO_ORIGIN_USER if inserted at document beginning).
     origin_user_idx: u16,
-    /// Origin sequence number.
+    /// Origin sequence number (the specific character we inserted after).
     origin_seq: u32,
+    /// Offset into the user's content column where this span's bytes start.
     content_offset: u32,
+    /// Index of the user who created this span.
     user_idx: u16,
+    /// Whether this span has been deleted (tombstone).
     deleted: bool,
+    /// Padding for alignment (not used).
     _padding: [u8; 1],
 }
 
@@ -249,11 +286,18 @@ impl Span {
     }
 
     /// Split this span at the given offset, returning the right part.
-    /// The right part's origin is set to the last character of the left part.
+    ///
+    /// After splitting "hello" at offset 2:
+    /// - Left span: "he" (seq 0..2)
+    /// - Right span: "llo" (seq 2..5), origin points to 'e' (the last char of left)
+    ///
+    /// The right part's origin is automatically set to the last character of the
+    /// left part, maintaining the invariant that each span knows what it follows.
     #[inline]
     fn split(&mut self, offset: u32) -> Span {
         debug_assert!(offset > 0 && offset < self.len);
-        // The right part's origin is the character just before the split
+        // The right part's origin is the character immediately before the split point.
+        // This maintains the RGA invariant: we know exactly what each span follows.
         let right = Span {
             seq: self.seq + offset,
             len: self.len - offset,
@@ -274,12 +318,16 @@ impl Span {
     }
 }
 
-/// Per-user append-only column storing content.
+/// Per-user column storing content bytes.
+///
+/// Each user's inserted content is stored in their own column as a contiguous
+/// byte array. Spans reference into their user's column via content_offset.
+/// The column is append-only: new inserts add bytes to the end.
 #[derive(Clone, Debug)]
 struct Column {
     /// The content bytes for this user's insertions.
     content: Vec<u8>,
-    /// Next sequence number to assign.
+    /// Next sequence number to assign for new inserts by this user.
     next_seq: u32,
 }
 
@@ -294,27 +342,30 @@ impl Column {
 
 /// Cursor cache for amortizing sequential lookups.
 ///
-/// Text editing has strong locality: sequential typing inserts at pos+1,
-/// backspace deletes at pos-1. By caching the last lookup result, we can
-/// scan from the cached position instead of doing a full O(log n) lookup.
+/// Text editing exhibits strong locality: when typing "hello", inserts happen
+/// at positions 0, 1, 2, 3, 4 in sequence. Without caching, each insert would
+/// require an O(log n) tree traversal to find the insertion point.
 ///
-/// For sequential typing, this turns O(log n) per insert into O(1) amortized.
+/// By caching the last lookup result, sequential typing becomes O(1) amortized:
+/// - Cache hit: use cached position directly
+/// - One position forward: scan from cached position (usually same span)
+/// - Cache miss: fall back to full O(log n) lookup, then cache result
 ///
-/// This cache also stores chunk location to avoid repeated find_chunk_by_index calls.
+/// The cache also stores B-tree chunk location to avoid repeated tree traversals.
 #[derive(Clone, Debug)]
 struct CursorCache {
-    /// The visible position that was looked up (the character BEFORE which we insert).
-    /// For insert at pos P, we look up pos P-1 to find the origin.
+    /// The visible position of the last lookup (position of the character we found).
+    /// For an insert at pos P, we look up pos P-1 to find the origin character.
     visible_pos: u64,
-    /// The span index containing that position.
+    /// Index of the span containing the cached position.
     span_idx: usize,
-    /// The offset within the span.
+    /// Offset within the span where the cached position falls.
     offset_in_span: u64,
-    /// The chunk index containing the span (for avoiding find_chunk_by_index).
+    /// B-tree chunk index containing the span (optimization to skip tree traversal).
     chunk_idx: usize,
-    /// The index within the chunk (for avoiding find_chunk_by_index).
+    /// Index of the span within its B-tree chunk.
     idx_in_chunk: usize,
-    /// Whether the cache is valid.
+    /// Whether the cache contains valid data.
     valid: bool,
 }
 
@@ -345,57 +396,57 @@ impl CursorCache {
         self.valid = true;
     }
 
-    /// Adjust the cache after an insert at the given position with the given length.
-    /// The insert position is where the new content starts (before adjustment).
-    /// When a new span is inserted, it can shift span indices and invalidate our cache.
-    fn adjust_after_insert(&mut self, _insert_pos: u64, _insert_len: u64, _new_span_idx: usize) {
-        // When inserting at a position different from where we cached,
-        // the span indices can shift in complex ways. Rather than trying to track
-        // these changes precisely, we simply invalidate the cache.
-        // The next insert will do a fresh lookup and re-establish the cache.
-        // This only affects non-sequential inserts (e.g., insert at beginning after
-        // typing at the end), which are relatively rare.
-        self.invalidate();
-    }
-
-    /// Adjust the cache after a delete starting at the given position with the given length.
-    /// We can preserve the cache in some cases:
-    /// - If the delete is entirely AFTER the cached position, the cache is still valid
-    ///   (the span_idx and offset_in_span don't change for earlier positions)
-    /// - If the delete touches or precedes the cached position, we must invalidate
-    fn adjust_after_delete(&mut self, delete_pos: u64, _delete_len: u64) {
+    /// Invalidate the cache after a delete operation.
+    /// 
+    /// Deletions can cause span splits which change span indices unpredictably.
+    /// Rather than tracking index shifts precisely (which would be error-prone),
+    /// we conservatively invalidate the cache when a delete might affect it.
+    ///
+    /// The cache remains valid only if the delete is entirely after the cached position.
+    fn adjust_after_delete(&mut self, delete_pos: u64) {
         if !self.valid {
             return;
         }
-        // If the delete starts after our cached position, the cache is still valid
-        // because deletions after our position don't affect span indices before it
+        // If the delete starts after our cached position, it cannot affect
+        // the span containing our cached character.
         if delete_pos > self.visible_pos {
-            // Cache remains valid - delete is after our cached position
             return;
         }
-        // Delete touches or precedes cached position - must invalidate
         self.invalidate();
     }
 }
 
 /// A Replicated Growable Array.
 ///
-/// Uses a weighted list of spans where each span's weight is its visible
-/// character count. This enables O(log n) position lookup once the weighted
-/// list is optimized.
+/// The core data structure for collaborative text editing. Stores document
+/// content as a list of spans, where each span's weight is its visible
+/// character count. This enables O(log n) position-to-span lookup.
+///
+/// # Architecture
+///
+/// - **Spans**: Stored in a B-tree weighted by visible length. Deleted spans
+///   have weight 0, so they are skipped during position lookups.
+/// - **Columns**: Each user has a column storing their inserted content bytes.
+///   Spans reference into their user's column via content_offset.
+/// - **Origin index**: Maps origin IDs to spans that share that origin,
+///   enabling efficient sibling lookup during concurrent insert resolution.
+#[derive(Clone)]
 pub struct Rga {
     /// Spans in document order, weighted by visible character count.
+    /// The B-tree enables O(log n) lookup by visible position.
     spans: BTreeList<Span>,
-    /// Per-user columns for content storage, indexed by user_idx.
+    /// Per-user columns storing content bytes, indexed by user_idx.
+    /// Spans reference their content via (user_idx, content_offset, len).
     columns: Vec<Column>,
-    /// Maps KeyPub to user index.
+    /// Bidirectional mapping between KeyPub and compact user indices.
     users: UserTable,
-    /// Cursor cache for amortizing sequential lookups.
+    /// Cache for amortizing sequential typing lookups.
     cursor_cache: CursorCache,
-    /// Lamport timestamp for versioning.
+    /// Lamport timestamp, incremented on each local operation.
     lamport: u64,
-    /// Index from origin ID to list of span indices with that origin.
-    /// Enables O(k) sibling lookup instead of O(n) scan.
+    /// Index from origin ID to list of span indices sharing that origin.
+    /// Used to efficiently find siblings during concurrent insert resolution.
+    /// Key is (user_idx, seq) of the origin character.
     origin_index: FxHashMap<(u16, u32), SmallVec<[usize; 4]>>,
 }
 
@@ -446,11 +497,8 @@ impl Rga {
     }
 
     /// Insert content using a pre-computed user index.
-    /// This avoids HashMap lookups when the caller already has the user_idx.
-    /// Does not return ItemId to avoid the overhead of looking up the user key.
     #[inline]
     fn insert_with_user_idx(&mut self, user_idx: u16, pos: u64, content: &[u8]) {
-        // Increment lamport clock
         self.lamport += 1;
 
         let column = &mut self.columns[user_idx as usize];
@@ -459,7 +507,6 @@ impl Rga {
         column.content.extend_from_slice(content);
         column.next_seq += content.len() as u32;
 
-        // Create the span (origin is set during insert_span_at_pos_optimized)
         let span = Span::new(
             user_idx,
             seq,
@@ -472,6 +519,18 @@ impl Rga {
     }
 
     /// Delete a range of visible characters starting at `start`.
+    ///
+    /// RGA uses tombstone deletion: characters are marked as deleted but not
+    /// removed from the span list. This preserves the total order for merging
+    /// with other replicas. Deleted spans have weight 0, so they are skipped
+    /// during position lookups and iteration.
+    ///
+    /// A delete may need to split spans if the deletion range doesn't align
+    /// with span boundaries. Four cases are handled:
+    /// - Delete entire span: just mark as deleted
+    /// - Delete prefix: split, delete left part
+    /// - Delete suffix: split, delete right part
+    /// - Delete middle: split twice, delete middle part
     pub fn delete(&mut self, start: u64, len: u64) {
         if len == 0 {
             return;
@@ -486,18 +545,12 @@ impl Rga {
             );
         }
 
-        // Increment lamport clock
         self.lamport += 1;
-
-        // Adjust or invalidate the cursor cache
-        // Delete operations can create/remove spans, so we invalidate if the delete
-        // touches or precedes the cached position to keep things simple and correct.
-        self.cursor_cache.adjust_after_delete(start, len);
+        self.cursor_cache.adjust_after_delete(start);
 
         let mut remaining = len;
 
         while remaining > 0 {
-            // Find the span at current visible position
             let (span_idx, offset_in_span) = match self.spans.find_by_weight(start) {
                 Some((idx, off)) => (idx, off),
                 None => panic!("position {} not found", start),
@@ -507,12 +560,12 @@ impl Rga {
             let span_visible = span.visible_len() as u64;
 
             if offset_in_span == 0 && remaining >= span_visible {
-                // Delete entire span - mark as deleted and update weight to 0
+                // Case 1: Delete covers entire span - just mark as deleted
                 self.spans.get_mut(span_idx).unwrap().deleted = true;
                 self.spans.update_weight(span_idx, 0);
                 remaining -= span_visible;
             } else if offset_in_span == 0 {
-                // Delete prefix of span - split and delete left part
+                // Case 2: Delete prefix of span - split and delete left part
                 let mut span = self.spans.remove(span_idx);
                 let right = span.split(remaining as u32);
                 span.deleted = true;
@@ -520,7 +573,7 @@ impl Rga {
                 self.spans.insert(span_idx + 1, right, right.visible_len() as u64);
                 remaining = 0;
             } else if offset_in_span + remaining >= span_visible {
-                // Delete suffix of span - split and delete right part
+                // Case 3: Delete suffix of span - split and delete right part
                 let to_delete = span_visible - offset_in_span;
                 let mut span = self.spans.remove(span_idx);
                 let mut right = span.split(offset_in_span as u32);
@@ -529,7 +582,7 @@ impl Rga {
                 self.spans.insert(span_idx + 1, right, 0);
                 remaining -= to_delete;
             } else {
-                // Delete middle of span - split twice
+                // Case 4: Delete middle of span - split twice, delete middle
                 let mut span = self.spans.remove(span_idx);
                 let mut mid_right = span.split(offset_in_span as u32);
                 let right = mid_right.split(remaining as u32);
@@ -832,41 +885,46 @@ impl Rga {
         return version.snapshot.len;
     }
 
-    /// Insert a span at the given visible position (for local edits).
-    /// Optimized version that sets the origin during insert to avoid double lookup.
-    /// Attempts to coalesce with the preceding span if possible.
-    /// Uses cursor caching for O(1) sequential typing with chunk location caching.
+    /// Insert a span at the given visible position for local edits.
+    /// 
+    /// This is the hot path for local typing. It attempts two optimizations:
+    ///
+    /// 1. **Cursor caching**: If the insert position is at or near the cached
+    ///    position, we skip the O(log n) tree lookup and use the cached location.
+    ///
+    /// 2. **Span coalescing**: If the new span is contiguous with the previous
+    ///    span (same user, consecutive sequence numbers, adjacent content), we
+    ///    extend the existing span instead of creating a new one. This keeps
+    ///    span count low during sequential typing.
     #[inline]
     fn insert_span_at_pos_optimized(&mut self, mut span: Span, pos: u64) {
         let span_len = span.visible_len() as u64;
 
         if self.spans.is_empty() {
-            // No origin for first span
             self.spans.insert(0, span, span_len);
-            // Cache the end of what we just inserted (chunk 0, idx 0 after insert)
             self.cursor_cache.update(pos + span_len - 1, 0, span_len - 1, 0, 0);
             return;
         }
 
         if pos == 0 {
-            // No origin when inserting at beginning
+            // Inserting at document beginning - cache is invalidated because
+            // all span indices shift by one.
             self.spans.insert(0, span, span_len);
-            // Adjust cache: spans shifted right, cache position shifted by span_len
-            self.cursor_cache.adjust_after_insert(0, span_len, 0);
+            self.cursor_cache.invalidate();
             return;
         }
 
-        // The position we need to look up: the character just before insert position
         let lookup_pos = pos - 1;
 
-        // Try to use the cursor cache for sequential typing
-        // Sequential typing: last insert was at position P, next insert is at P + last_len
-        // So we look up P + last_len - 1, which should be cached as the end of last insert
-        // We also cache chunk location to avoid find_chunk_by_index calls
+        // Try to use the cursor cache for sequential typing.
+        // Three cases:
+        // 1. Exact cache hit: lookup_pos matches cached position
+        // 2. One position forward: common during sequential typing
+        // 3. Cache miss: fall back to full O(log n) tree lookup
         let (prev_idx, offset_in_prev, chunk_idx, idx_in_chunk) = if self.cursor_cache.valid
             && self.cursor_cache.visible_pos == lookup_pos
         {
-            // Cache hit! Use cached position and chunk location directly
+            // Case 1: Exact cache hit - use cached values directly
             (
                 self.cursor_cache.span_idx,
                 self.cursor_cache.offset_in_span,
@@ -877,8 +935,7 @@ impl Rga {
             && self.cursor_cache.visible_pos + 1 == lookup_pos
             && self.cursor_cache.span_idx < self.spans.len()
         {
-            // One position forward from cache - common for sequential typing after non-coalescing insert
-            // Try to scan forward one character using cached chunk location
+            // Case 2: One position forward from cache (sequential typing)
             let cached_span = self.spans.get_with_chunk_hint(
                 self.cursor_cache.chunk_idx,
                 self.cursor_cache.idx_in_chunk,
@@ -886,7 +943,7 @@ impl Rga {
             let cached_visible = cached_span.visible_len() as u64;
             
             if self.cursor_cache.offset_in_span + 1 < cached_visible {
-                // Next position is within the same span
+                // Next position is still within the same span - just increment offset
                 (
                     self.cursor_cache.span_idx,
                     self.cursor_cache.offset_in_span + 1,
@@ -894,43 +951,24 @@ impl Rga {
                     self.cursor_cache.idx_in_chunk,
                 )
             } else {
-                // Need to move to next span - scan forward
-                let mut idx = self.cursor_cache.span_idx + 1;
-                while idx < self.spans.len() {
-                    let s = self.spans.get(idx).unwrap();
-                    if s.visible_len() > 0 {
-                        break;
-                    }
-                    idx += 1;
-                }
-                if idx < self.spans.len() {
-                    // Need full lookup for chunk info since we moved spans
-                    match self.spans.find_by_weight_with_chunk(lookup_pos) {
-                        Some((span_idx, off, c_idx, i_in_c)) => (span_idx, off, c_idx, i_in_c),
-                        None => {
-                            self.spans.insert(self.spans.len(), span, span_len);
-                            self.cursor_cache.invalidate();
-                            return;
-                        }
-                    }
-                } else {
-                    // Fallback to full lookup
-                    match self.spans.find_by_weight_with_chunk(lookup_pos) {
-                        Some((span_idx, off, c_idx, i_in_c)) => (span_idx, off, c_idx, i_in_c),
-                        None => {
-                            self.spans.insert(self.spans.len(), span, span_len);
-                            self.cursor_cache.invalidate();
-                            return;
-                        }
+                // We've reached the end of the cached span.
+                // Fall back to full lookup to find the next visible span.
+                // This happens when typing reaches a span boundary.
+                match self.spans.find_by_weight_with_chunk(lookup_pos) {
+                    Some((span_idx, off, c_idx, i_in_c)) => (span_idx, off, c_idx, i_in_c),
+                    None => {
+                        self.spans.insert(self.spans.len(), span, span_len);
+                        self.cursor_cache.invalidate();
+                        return;
                     }
                 }
             }
         } else {
-            // Cache miss - do full lookup with chunk info
+            // Case 3: Cache miss - perform full O(log n) tree lookup
             match self.spans.find_by_weight_with_chunk(lookup_pos) {
                 Some((span_idx, off, c_idx, i_in_c)) => (span_idx, off, c_idx, i_in_c),
                 None => {
-                    // pos >= total_weight + 1, insert at end (shouldn't normally happen)
+                    // Position not found - append at end
                     self.spans.insert(self.spans.len(), span, span_len);
                     self.cursor_cache.invalidate();
                     return;
@@ -938,25 +976,28 @@ impl Rga {
             }
         };
 
-        // Use cached chunk location to get prev_span without find_chunk_by_index
         let prev_span = self.spans.get_with_chunk_hint(chunk_idx, idx_in_chunk).unwrap();
         let prev_visible_len = prev_span.visible_len() as u64;
         
-        // Set the origin from the lookup we just did
-        // Origin is (user_idx, seq) of the character we are inserting after
+        // The origin is the character we're inserting after (at offset_in_prev in prev_span)
         let origin_seq = prev_span.seq + offset_in_prev as u32;
         span.set_origin(OriginId::some(prev_span.user_idx, origin_seq));
 
-        // Check if we can coalesce: same user, consecutive seq, contiguous content, not deleted
-        // Also check offset_in_prev == prev_span.visible_len - 1 to ensure we're at the end of the span
-        if prev_span.user_idx == span.user_idx
+        // Try to coalesce with previous span. Coalescing is possible when:
+        // - Same user created both spans
+        // - Previous span is not deleted
+        // - Sequence numbers are contiguous (prev ends where new begins)
+        // - Content bytes are contiguous in the column
+        // - We're inserting at the end of the previous span
+        let can_coalesce = prev_span.user_idx == span.user_idx
             && !prev_span.deleted
             && prev_span.seq + prev_span.len == span.seq
             && prev_span.content_offset + prev_span.len == span.content_offset
-            && offset_in_prev == prev_visible_len - 1
-        {
-            // Coalesce by extending the previous span
-            // Use modify_and_update_weight_with_hint to avoid chunk lookup
+            && offset_in_prev == prev_visible_len - 1;
+
+        if can_coalesce {
+            // Extend the previous span instead of creating a new one.
+            // This keeps span count low during sequential typing.
             let add_len = span.len;
             let (new_weight, new_chunk_idx, new_idx_in_chunk) = self.spans.modify_and_update_weight_with_hint(
                 chunk_idx,
@@ -967,8 +1008,6 @@ impl Rga {
                 },
             ).unwrap();
             
-            // Update cache: point to end of the coalesced span with chunk location
-            // After insert at pos with span_len, the last inserted char is at pos + span_len - 1
             self.cursor_cache.update(
                 pos + span_len - 1,
                 prev_idx,
@@ -979,39 +1018,32 @@ impl Rga {
             return;
         }
 
-        // Can't coalesce - determine insert position based on the lookup we already did
-        // If offset_in_prev is at the end of prev_span, insert after it
-        // Otherwise we need to split prev_span
+        // Cannot coalesce - must insert as a new span
         if offset_in_prev == prev_visible_len - 1 {
-            // Insert right after prev_span
+            // Inserting at the end of prev_span - no split needed
             self.spans.insert(prev_idx + 1, span, span_len);
-            
-            // Update cache to point to end of newly inserted span
-            // This allows the next sequential insert to use the cache
-            // Note: We don't know the exact leaf location after insert (it may have split),
-            // so we just invalidate and let the next lookup rebuild the cache.
-            // A more sophisticated approach would track the new location.
             self.cursor_cache.invalidate();
         } else {
-            // Need to split prev_span - insert in the middle
+            // Inserting in the middle of prev_span - must split it first.
+            // After split: [left part] [new span] [right part]
             let split_offset = (offset_in_prev + 1) as u32;
             let mut existing = self.spans.remove(prev_idx);
             let right = existing.split(split_offset);
             self.spans.insert(prev_idx, existing, existing.visible_len() as u64);
             self.spans.insert(prev_idx + 1, span, span_len);
             self.spans.insert(prev_idx + 2, right, right.visible_len() as u64);
-            
-            // Invalidate cache - structural changes
             self.cursor_cache.invalidate();
         }
     }
 
-    /// Find span containing the given ItemId using linear search.
+    /// Find the span containing a character identified by ItemId.
+    ///
+    /// Uses linear search O(n). This is acceptable because:
+    /// - It's only used for remote operations (apply/merge), not local edits
+    /// - Remote operations are less frequent than local typing
+    /// - A more complex index would add memory overhead
     fn find_span_by_id(&self, id: &ItemId) -> Option<usize> {
-        let user_idx = match self.users.get(&id.user) {
-            Some(idx) => idx,
-            None => return None,
-        };
+        let user_idx = self.users.get(&id.user)?;
         let seq = id.seq as u32;
         for (i, span) in self.spans.iter().enumerate() {
             if span.user_idx == user_idx && span.contains_seq(seq) {
@@ -1020,7 +1052,6 @@ impl Rga {
         }
         return None;
     }
-
 }
 
 impl Default for Rga {
@@ -1086,11 +1117,18 @@ impl Rga {
         }
     }
 
-    /// Insert a span using RGA ordering rules with origin index optimization.
+    /// Insert a span using RGA ordering rules for remote/merge operations.
     /// 
-    /// When multiple spans share the same origin (siblings), we use the origin_index
-    /// to find them in O(k) time instead of O(n) scan. Among siblings, we order by
-    /// (user, seq) descending for deterministic conflict resolution.
+    /// RGA uses a deterministic ordering to resolve concurrent insertions at
+    /// the same position. When multiple users insert after the same origin
+    /// character (creating "siblings"), they are ordered by (user, seq) descending.
+    /// This ensures all replicas converge to the same document order.
+    ///
+    /// # Origin Index Optimization
+    ///
+    /// Finding siblings normally requires O(n) linear scan. The origin_index
+    /// maps each origin to spans that share it, enabling O(k) lookup where
+    /// k = number of concurrent edits at that position (typically small).
     fn insert_span_rga(&mut self, mut span: Span, origin: Option<ItemId>) {
         let span_len = span.visible_len() as u64;
 
@@ -1100,19 +1138,17 @@ impl Rga {
         }
 
         let insert_idx = if let Some(ref origin_id) = origin {
-            // Convert origin to stable (user_idx, seq)
+            // Convert origin ItemId to stable (user_idx, seq) form
             let origin_user_idx = self.ensure_user(&origin_id.user);
             let origin_seq = origin_id.seq as u32;
-            
-            // Set the origin using stable identifiers
             span.set_origin(OriginId::some(origin_user_idx, origin_seq));
             
-            // Find the origin span to determine base insert position
             if let Some(origin_idx) = self.find_span_by_id(origin_id) {
                 let origin_span = self.spans.get(origin_idx).unwrap();
                 let offset_in_span = origin_seq - origin_span.seq;
 
-                // If origin is in the middle of a span, split it
+                // If the origin character is in the middle of a span, we must
+                // split it so we can insert immediately after the origin.
                 if offset_in_span < origin_span.len - 1 {
                     let mut existing = self.spans.remove(origin_idx);
                     let right = existing.split(offset_in_span + 1);
@@ -1120,87 +1156,90 @@ impl Rga {
                     self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
                 }
 
-                // ORIGIN INDEX OPTIMIZATION:
-                // Use the origin index to find siblings with the same origin.
-                // This is O(k) where k = number of concurrent edits at same position,
-                // instead of O(n) linear scan.
+                // Find the correct position among siblings (spans sharing this origin).
+                // RGA ordering: higher (user, seq) comes first.
                 let origin_key = (origin_user_idx, origin_seq);
-                let sibling_indices: SmallVec<[usize; 4]> = self.origin_index
-                    .get(&origin_key)
-                    .cloned()
-                    .unwrap_or_default();
-                
-                // Find correct position among siblings using RGA ordering
                 let span_user = self.users.get_key(span.user_idx).unwrap();
                 let mut insert_pos = origin_idx + 1;
                 
-                // Check siblings from the index
-                for &sibling_idx in &sibling_indices {
-                    if sibling_idx >= self.spans.len() {
-                        continue; // Stale index entry
-                    }
-                    let sibling = self.spans.get(sibling_idx).unwrap();
-                    if !sibling.has_origin() {
-                        continue;
-                    }
-                    let sibling_origin = sibling.origin();
-                    if sibling_origin.user_idx != origin_user_idx || sibling_origin.seq != origin_seq {
-                        continue; // Not actually a sibling
-                    }
-                    
-                    // RGA ordering: higher (user, seq) comes first
-                    let sibling_user = self.users.get_key(sibling.user_idx).unwrap();
-                    if (sibling_user, sibling.seq) > (span_user, span.seq) {
-                        if sibling_idx + 1 > insert_pos {
-                            insert_pos = sibling_idx + 1;
+                // Use origin index to find siblings in O(k) instead of O(n)
+                if let Some(sibling_indices) = self.origin_index.get(&origin_key) {
+                    for &sibling_idx in sibling_indices {
+                        // Skip stale index entries (can happen after spans are removed)
+                        if sibling_idx >= self.spans.len() {
+                            continue;
+                        }
+                        let sibling = self.spans.get(sibling_idx).unwrap();
+                        
+                        // Verify this is actually a sibling with the same origin
+                        if !sibling.has_origin() {
+                            continue;
+                        }
+                        let sibling_origin = sibling.origin();
+                        if sibling_origin.user_idx != origin_user_idx || sibling_origin.seq != origin_seq {
+                            continue;
+                        }
+                        
+                        // RGA ordering: if sibling has higher (user, seq), we insert after it
+                        let sibling_user = self.users.get_key(sibling.user_idx).unwrap();
+                        if (sibling_user, sibling.seq) > (span_user, span.seq) {
+                            insert_pos = insert_pos.max(sibling_idx + 1);
                         }
                     }
                 }
                 
-                // Also scan from origin+1 for correctness (catches unindexed siblings)
+                // Also scan linearly from origin+1 to catch any unindexed siblings.
+                // This ensures correctness even if the index is incomplete.
                 let mut pos = origin_idx + 1;
                 while pos < self.spans.len() {
                     let other = self.spans.get(pos).unwrap();
-                    if other.has_origin() {
-                        let other_origin = other.origin();
-                        if other_origin.user_idx == origin_user_idx && other_origin.seq == origin_seq {
-                            let other_user = self.users.get_key(other.user_idx).unwrap();
-                            if (other_user, other.seq) > (span_user, span.seq) {
-                                pos += 1;
-                                insert_pos = insert_pos.max(pos);
-                                continue;
-                            }
-                        }
+                    if !other.has_origin() {
+                        break;
                     }
-                    break;
+                    let other_origin = other.origin();
+                    if other_origin.user_idx != origin_user_idx || other_origin.seq != origin_seq {
+                        break;
+                    }
+                    // This span is a sibling - check RGA ordering
+                    let other_user = self.users.get_key(other.user_idx).unwrap();
+                    if (other_user, other.seq) > (span_user, span.seq) {
+                        pos += 1;
+                        insert_pos = insert_pos.max(pos);
+                    } else {
+                        break;
+                    }
                 }
                 
                 insert_pos
             } else {
+                // Origin not found - append at end (this shouldn't happen in normal operation)
                 self.spans.len()
             }
         } else {
-            // No origin - insert at beginning with RGA ordering
-            let mut pos = 0;
+            // No origin means insert at document beginning.
+            // Must still respect RGA ordering among other beginning-inserted spans.
             let span_user = self.users.get_key(span.user_idx).unwrap();
+            let mut pos = 0;
             while pos < self.spans.len() {
                 let other = self.spans.get(pos).unwrap();
-                if !other.has_origin() {
-                    let other_user = self.users.get_key(other.user_idx).unwrap();
-                    if (other_user, other.seq) > (span_user, span.seq) {
-                        pos += 1;
-                        continue;
-                    }
+                // Only compare with other spans that also have no origin
+                if other.has_origin() {
+                    break;
                 }
-                break;
+                let other_user = self.users.get_key(other.user_idx).unwrap();
+                if (other_user, other.seq) > (span_user, span.seq) {
+                    pos += 1;
+                } else {
+                    break;
+                }
             }
             pos
         };
 
-        // Insert the span
+        // Insert the span at the determined position
         self.spans.insert(insert_idx, span, span_len);
         
-        // Update the origin index
+        // Update the origin index for future sibling lookups
         if span.has_origin() {
             let origin_key = span.origin().as_key();
             self.origin_index
@@ -1210,21 +1249,6 @@ impl Rga {
         }
     }
     
-    /// Rebuild the origin index from scratch.
-    /// Call this after operations that may have invalidated span indices.
-    fn rebuild_origin_index(&mut self) {
-        self.origin_index.clear();
-        for (idx, span) in self.spans.iter().enumerate() {
-            if span.has_origin() {
-                let origin_key = span.origin().as_key();
-                self.origin_index
-                    .entry(origin_key)
-                    .or_insert_with(SmallVec::new)
-                    .push(idx);
-            }
-        }
-    }
-
     fn delete_by_id(&mut self, id: &ItemId) -> bool {
         let idx = match self.find_span_by_id(id) {
             Some(i) => i,
@@ -1273,29 +1297,29 @@ impl Rga {
 
 // --- Buffered wrapper for batching adjacent operations ---
 
-/// A pending insert operation waiting to be flushed.
+/// A pending insert operation waiting to be flushed to the underlying RGA.
 #[derive(Clone, Debug)]
 struct PendingInsert {
-    /// The user performing the insert.
+    /// Index of the user performing the insert.
     user_idx: u16,
-    /// The starting position.
+    /// Starting visible position for the insert.
     pos: u64,
-    /// The accumulated content bytes.
+    /// Accumulated content bytes.
     /// SmallVec avoids heap allocation for small inserts (most are 1-byte).
-    /// 32 bytes inline = fits typical typing bursts without allocation.
+    /// 32 bytes inline capacity fits typical typing bursts without allocation.
     content: SmallVec<[u8; 32]>,
 }
 
-/// A pending delete operation waiting to be flushed.
+/// A pending delete operation waiting to be flushed to the underlying RGA.
 #[derive(Clone, Debug)]
 struct PendingDelete {
-    /// The starting position of the delete range.
+    /// Starting visible position of the delete range.
     start: u64,
-    /// The length of the delete range.
+    /// Number of characters to delete.
     len: u64,
 }
 
-/// Pending operation type for RgaBuf.
+/// Pending operation type for RgaBuf buffering.
 #[derive(Clone, Debug)]
 enum PendingOp {
     Insert(PendingInsert),
@@ -1304,26 +1328,28 @@ enum PendingOp {
 
 /// A buffered wrapper around Rga that batches adjacent operations.
 ///
-/// Text editing traces show strong locality: sequential typing inserts at
-/// positions P, P+1, P+2, etc. By buffering these adjacent inserts and
-/// applying them as a single operation, we can significantly reduce overhead.
+/// Text editing exhibits strong locality: when typing "hello", inserts happen
+/// at positions 0, 1, 2, 3, 4 in sequence. Without buffering, each keystroke
+/// would trigger a separate RGA insert operation.
 ///
-/// This wrapper also optimizes:
-/// - Backspace at end of pending insert: trim buffer instead of flush+delete
-/// - Adjacent deletes (backspace): buffer deletes at P, P-1, P-2...
-/// - Adjacent deletes (forward delete): buffer deletes at P, P, P...
+/// RgaBuf buffers adjacent operations and applies them as a single batch:
+/// - Sequential typing at positions P, P+1, P+2... is buffered into one insert
+/// - Backspace at end of pending insert trims the buffer (no RGA operation needed)
+/// - Adjacent backspaces (P, P-1, P-2...) are buffered into one delete
+/// - Adjacent forward deletes (P, P, P...) are buffered into one delete
 ///
-/// JumpRopeBuf (used by diamond-types) achieves ~10x speedup for sequential
-/// editing patterns using this technique.
+/// This technique (inspired by JumpRopeBuf in diamond-types) achieves significant
+/// speedup for sequential editing patterns by reducing per-keystroke overhead.
 ///
-/// Usage:
-/// - Use `insert` and `delete` as normal
-/// - Call `flush` before any read operation (len, to_string)
-/// - The wrapper automatically flushes when switching between insert/delete
+/// # Usage
+///
+/// Use `insert` and `delete` as normal. Read operations (`len`, `to_string`,
+/// `span_count`) automatically flush pending operations first. The buffer also
+/// auto-flushes when switching between insert and delete operations.
 pub struct RgaBuf {
-    /// The underlying RGA.
+    /// The underlying RGA document.
     rga: Rga,
-    /// Pending operation, if any.
+    /// Pending operation waiting to be flushed, if any.
     pending: Option<PendingOp>,
 }
 
