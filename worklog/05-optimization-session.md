@@ -1,67 +1,157 @@
 +++
-title = "Optimization Session: Faster than Diamond-Types"
-date = 2026-02-01
+model = "claude-opus-4-5"
+created = 2026-02-01
+modified = 2026-02-01
+driver = "Isaac Clayton"
 +++
+
+# Worklog: RGA Optimization Session
 
 ## Goal
 
-Faster than diamond-types on 3/4 benchmarks.
+Achieve faster than diamond-types on 3/4 benchmarks while maintaining correctness.
 
-## Baseline Benchmarks
+## Starting Point
 
-| Trace | Patches | Together | Diamond | Ratio |
-|-------|---------|----------|---------|-------|
-| sveltecomponent | 19,749 | 7.1ms | 1.6ms | 4.5x slower |
-| rustcode | 40,173 | 26.3ms | 3.9ms | 6.7x slower |
-| seph-blog1 | 137,993 | 72.5ms | 8.4ms | 8.7x slower |
-| automerge-paper | 259,778 | 25.7ms | 13.8ms | 1.9x slower |
+After previous refactoring work, benchmarks showed:
+- sveltecomponent: 4.5x slower
+- rustcode: 6.7x slower  
+- seph-blog1: 8.7x slower
+- automerge-paper: 1.9x slower
 
-## Research Findings
+## Optimizations Applied
 
-### Diamond-Types
-- Uses RLE-compressed operation log
-- Content stored separately (SoA layout)
-- O(log n) lookups via binary search on RleVec
-- Fast-path for sequential local edits
-- Cursor caching for sequential access
+### 1. Refactor insert_span_rga into smaller functions
 
-### json-joy
-- Dual splay tree architecture:
-  - `root` tree ordered by document position
-  - `ids` tree ordered by (sid, time) for O(log n) ID lookup
-- Each chunk has 6 tree pointers (3 per tree)
-- Splay operation moves recently accessed to root
-- Good for sequential access patterns
+Extracted YATA ordering logic into separate functions:
+- `yata_compare()` - pure YATA comparison
+- `find_position_with_origin()` - find insert position with origin
+- `find_position_at_root()` - find insert position without origin
+- `origin_in_subtree()`, `add_to_subtree()`, `is_sibling()` - helpers
 
-### Our Bottlenecks
-1. `find_span_by_id()` is O(n) linear scan - called in tight loops during merge
-2. `insert_span_rga` is 260 lines with duplicated logic
-3. Subtree tracking uses O(n) linear search per iteration
+This reduced the main function from ~260 lines to ~50 lines (Linux kernel style: max 3 levels deep).
 
-## Optimization Plan
+### 2. Implement ID lookup index
 
-### Phase 1: Refactoring (Correctness Focus)
-1. Extract `insert_span_rga` into smaller functions
-2. Add comprehensive tests for each extracted function
-3. Extract YATA comparison logic
+Added `id_index: FxHashMap<(u16, u32), usize>` for O(1) span lookup by ID during merge operations. Index is rebuilt before merge via `rebuild_id_index()`.
 
-### Phase 2: ID Lookup Index
-1. Add `HashMap<(u16, u32), usize>` for O(1) ID lookup
-2. Maintain index on insert/split/delete
-3. Add debug assertions to validate index correctness
+### 3. Optimize non-coalescing inserts with hint
 
-### Phase 3: Batch Merge Optimization
-1. Pre-scan to find known ID ranges
-2. Bulk insert missing spans
-3. Verify against naive merge in tests
+Created `insert_span_rga_with_hint()` and `find_position_with_origin_hint()` to pass the known origin position directly, avoiding redundant `find_span_by_id()` O(n) lookup.
 
-### Phase 4: Cursor Caching
-1. Cache last insertion position
-2. Start from cache if nearby
-3. Fallback to normal path on cache miss
+Key insight: In `insert_span_at_pos_optimized`, when we can't coalesce, we already know the origin's position from the previous lookup. Passing this as a hint skips redundant work.
 
-## Progress
+### 4. Add fast path for YATA scan
 
-### Refactoring insert_span_rga
+Added early exit checks in both `find_position_with_origin` and `find_position_with_origin_hint`:
+- If no spans after origin → return immediately
+- If next span has no origin → return immediately  
+- If next span's origin doesn't match ours → return immediately
 
-TODO: Document progress here
+This avoids setting up subtree tracking (~24% of YATA scans exit via fast path).
+
+### 5. Use SmallVec for subtree tracking
+
+Replaced `Vec<(u16, u32, u32)>` with `SmallVec<[(u16, u32, u32); 8]>` in:
+- `find_position_with_origin`
+- `find_position_with_origin_hint`
+- `skip_subtree`
+- `add_to_subtree`
+
+This avoids heap allocation for typical single-user editing scenarios.
+
+### 6. Enable LTO and single codegen unit
+
+Added to Cargo.toml:
+```toml
+[profile.release]
+lto = true
+codegen-units = 1
+```
+
+This enables link-time optimization for better cross-crate inlining.
+
+## Profiling Insights
+
+Added profiling counters to understand hot paths:
+
+| Trace | Cursor Hit Rate | Coalesce | YATA Scans | Fast Exit |
+|-------|-----------------|----------|------------|-----------|
+| sveltecomponent | 0.1% | 80 | 2868 | 690 (24%) |
+| rustcode | 0.2% | 241 | 5906 | 1526 (26%) |
+| seph-blog1 | 0.4% | 501 | 6800 | 1454 (21%) |
+| automerge-paper | 0.0% | 120 | 4471 | 799 (18%) |
+
+Key findings:
+1. **Cursor cache hit rate is ~0%** - Expected because RgaBuf batches inserts
+2. **Coalesce rate is low** - RgaBuf does coalescing at higher level
+3. **~76% of YATA scans enter slow path** - Spans after origin ARE siblings/descendants
+4. **Fast exit triggers ~24%** - Still valuable for avoiding subtree tracking setup
+
+## Final Results
+
+| Trace | Together | Diamond | Ratio | Status |
+|-------|----------|---------|-------|--------|
+| sveltecomponent | 2.0ms | 1.6ms | 1.2-1.3x slower | ❌ |
+| rustcode | 4.2ms | 3.9ms | 1.0-1.2x slower | ⚠️ borderline |
+| seph-blog1 | 7.0ms | 8.6ms | **0.8x faster** | ✅ |
+| automerge-paper | 5.8ms | 14.0ms | **0.4x faster** | ✅ |
+
+Improvement from start of session:
+- sveltecomponent: 4.5x → 1.3x (3.5x improvement)
+- rustcode: 6.7x → 1.1x (6x improvement)
+- seph-blog1: 8.7x → 0.8x (11x improvement)
+- automerge-paper: 1.9x → 0.4x (5x improvement)
+
+## Why Slower Traces Are Slower
+
+Analysis of trace characteristics:
+
+| Trace | Jump Insert Ratio | Scattered Deletes |
+|-------|-------------------|-------------------|
+| sveltecomponent | 20.6% | 75.2% |
+| rustcode | 22.2% | 71.7% |
+| seph-blog1 | 8.2% | 66.0% |
+| automerge-paper | 3.4% | 5.5% |
+
+Higher jump insert ratio = more YATA scans needed.
+Higher scattered deletes = less benefit from delete batching.
+
+## Fundamental Differences with diamond-types
+
+diamond-types uses:
+1. **JumpRope** - skip list with 392-byte gap buffers
+2. **Cursor-based access** - maintains position for sequential operations
+3. **Gap buffers** - sequential inserts just extend gap, no tree rebalancing
+
+Our approach:
+1. **B-tree** - O(log n) for every operation
+2. **Cursor cache** - only helps for exact position match
+3. **Span coalescing** - good for sequential inserts but requires tree ops
+
+The ~10% gap on rustcode is likely due to:
+- More tree traversals for jump inserts
+- B-tree overhead vs skip list for sequential access patterns
+
+## Future Optimization Ideas
+
+1. **Splay tree / self-adjusting tree** - Move recently accessed nodes to root
+2. **Better cursor caching** - Cache nearby positions, not just exact match
+3. **Gap buffer integration** - Like diamond-types' JumpRope
+4. **Batch YATA scans** - Process multiple jump inserts together
+
+## Lessons Learned
+
+1. **Profile before optimizing** - The cursor cache wasn't the bottleneck we thought
+2. **Understand the data** - Jump insert ratio explains performance differences
+3. **Fast paths matter** - Even 24% early exit is valuable
+4. **Allocation avoidance** - SmallVec for small, hot allocations
+5. **LTO is free performance** - Just add it to Cargo.toml
+
+## Files Changed
+
+- `src/crdt/rga.rs` - Main optimizations
+- `src/crdt/btree_list.rs` - Already had good performance
+- `src/crdt/profiling.rs` - New, for performance counters
+- `Cargo.toml` - LTO settings
+- `comparisons/criterion/src/bin/analyze_trace.rs` - Trace analysis tool
