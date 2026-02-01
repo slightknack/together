@@ -1367,7 +1367,7 @@ impl Rga {
 
     /// Add a span's range to the subtree tracking.
     #[inline]
-    fn add_to_subtree(span: &Span, subtree_ranges: &mut Vec<(u16, u32, u32)>) {
+    fn add_to_subtree(span: &Span, subtree_ranges: &mut SmallVec<[(u16, u32, u32); 8]>) {
         subtree_ranges.push((span.user_idx, span.seq, span.seq + span.len - 1));
     }
 
@@ -1418,13 +1418,28 @@ impl Rga {
             self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
         }
         
-        // Initialize subtree tracking with just the origin
-        let origin_user_idx = self.ensure_user(&origin_id.user);
-        let mut subtree_ranges: Vec<(u16, u32, u32)> = vec![
-            (origin_user_idx, origin_id.seq as u32, origin_id.seq as u32)
-        ];
-        
         let mut pos = origin_idx + 1;
+        
+        // Fast path: check if we can exit immediately without YATA scan
+        if pos >= self.spans.len() {
+            return pos;
+        }
+        
+        let other = self.spans.get(pos).unwrap();
+        if !other.has_origin() {
+            return pos;
+        }
+        
+        let other_origin = other.origin();
+        let other_origin_user = self.users.get_key(other_origin.user_idx);
+        if other_origin_user != Some(&origin_id.user) || other_origin.seq as u64 != origin_id.seq {
+            return pos;
+        }
+        
+        // Slow path: need full YATA scan with subtree tracking
+        let origin_user_idx = self.ensure_user(&origin_id.user);
+        let mut subtree_ranges: SmallVec<[(u16, u32, u32); 8]> = SmallVec::new();
+        subtree_ranges.push((origin_user_idx, origin_id.seq as u32, origin_id.seq as u32));
         
         while pos < self.spans.len() {
             let other = self.spans.get(pos).unwrap();
@@ -1545,7 +1560,8 @@ impl Rga {
         // already included in the subtree.
         
         // Track all (user_idx, seq_start, seq_end) ranges in the subtree
-        let mut subtree_ranges: Vec<(u16, u32, u32)> = vec![(start_user_idx, start_seq, start_end_seq)];
+        let mut subtree_ranges: SmallVec<[(u16, u32, u32); 8]> = SmallVec::new();
+        subtree_ranges.push((start_user_idx, start_seq, start_end_seq));
         
         while pos < self.spans.len() {
             let other = self.spans.get(pos).unwrap();
@@ -1705,13 +1721,28 @@ impl Rga {
             idx_after_origin = origin_idx + 1; // Insert position is after left half
         }
         
-        // Initialize subtree tracking with just the origin
-        let origin_user_idx = self.ensure_user(&origin_id.user);
-        let mut subtree_ranges: Vec<(u16, u32, u32)> = vec![
-            (origin_user_idx, origin_id.seq as u32, origin_id.seq as u32)
-        ];
-        
         let mut pos = idx_after_origin;
+        
+        // Fast path: check if we can exit immediately without YATA scan
+        if pos >= self.spans.len() {
+            return pos;
+        }
+        
+        let other = self.spans.get(pos).unwrap();
+        if !other.has_origin() {
+            return pos;
+        }
+        
+        let other_origin = other.origin();
+        let other_origin_user = self.users.get_key(other_origin.user_idx);
+        if other_origin_user != Some(&origin_id.user) || other_origin.seq as u64 != origin_id.seq {
+            return pos;
+        }
+        
+        // Slow path: need full YATA scan with subtree tracking
+        let origin_user_idx = self.ensure_user(&origin_id.user);
+        let mut subtree_ranges: SmallVec<[(u16, u32, u32); 8]> = SmallVec::new();
+        subtree_ranges.push((origin_user_idx, origin_id.seq as u32, origin_id.seq as u32));
         
         while pos < self.spans.len() {
             let other = self.spans.get(pos).unwrap();

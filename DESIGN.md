@@ -248,3 +248,36 @@ There should be two functions: one that performs an topological iteration over a
 All events should be signed, verified, etc.
 
 I wonder if we took the wrong approach with the crdt? if we can topologically sort events, we can just use some arbitrary good merge algo and the result/replica will be eventually consistent?
+
+---
+
+I want you to write a new process doc here's my challenge to you:
+
+create a new branch. write an `Rga` trait. then, for each of:
+
+- diamond-types
+- loro
+- cola
+- json-joy
+- yjs
+
+do research and write up, in excruciating detail but plain prose:
+
+- what the data structure is
+- how the merge algorithm works
+- what optimizations
+
+then, create a new file in the crdt folder with the name of that library, and implement, from scratch, that approach. (A trait impl of `Rga`)
+
+I want you to build up a library or vocabulary of common primitives as you work: clocks, b-trees, splay trees, skip lists, caches, maps, and so on, that all the different implementations depend on. With lots of property-based tests too!
+
+That way, each implementation should be a rather minimal composition of CRDT building blocks. Write the code in a way that is compatible with our eventual log ideal.
+
+Then, once all implementations work and pass all tests, benchmark them and:
+
+- implement optimizations
+- start a new file that takes the best of everything
+
+when you're done, you can read Scratchpad in Design, BUT NOT BEFORE THEN.
+
+Write a process document in procedures, including instructions for the agent responsible for spinning up subagents and maintaining a tree of progress and a summary of learnings.
