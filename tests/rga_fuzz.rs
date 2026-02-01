@@ -696,36 +696,433 @@ proptest! {
             apply_rga_op(&mut rga2, &user2, op);
         }
         
-        // Debug spans before merge
-        eprintln!("\n=== SPANS BEFORE MERGE ===");
-        eprintln!("rga1 spans: {:?}", rga1.debug_spans());
-        eprintln!("rga2 spans: {:?}", rga2.debug_spans());
-        eprintln!("===========================\n");
-        
-        // Merge
-        eprintln!("\n>>> STARTING MERGE m12 (rga1 <- rga2) <<<");
+        // Merge both ways
         let mut m12 = rga1.clone();
         m12.merge(&rga2);
-        eprintln!(">>> FINISHED MERGE m12, doc = {:?} <<<\n", m12.to_string());
         
-        eprintln!("\n>>> STARTING MERGE m21 (rga2 <- rga1) <<<");
         let mut m21 = rga2.clone();
         m21.merge(&rga1);
-        eprintln!(">>> FINISHED MERGE m21, doc = {:?} <<<\n", m21.to_string());
-        
-        if m12.to_string() != m21.to_string() {
-            eprintln!("\n=== FAILURE DEBUG ===");
-            eprintln!("user1: {:?}", &user1.key_pub.0[..4]);
-            eprintln!("user2: {:?}", &user2.key_pub.0[..4]);
-            eprintln!("user1 > user2: {}", user1.key_pub > user2.key_pub);
-            eprintln!("base: {:?}", base.to_string());
-            eprintln!("rga1: {:?}", rga1.to_string());
-            eprintln!("rga2: {:?}", rga2.to_string());
-            eprintln!("m12: {:?}", m12.to_string());
-            eprintln!("m21: {:?}", m21.to_string());
-            eprintln!("=== END DEBUG ===\n");
-        }
         
         prop_assert_eq!(m12.to_string(), m21.to_string());
+    }
+}
+
+// =============================================================================
+// Advanced merge scenarios
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// Four users editing independently, all merges should converge
+    #[test]
+    fn four_way_convergence(
+        ops1 in prop::collection::vec(arbitrary_rga_op(), 1..15),
+        ops2 in prop::collection::vec(arbitrary_rga_op(), 1..15),
+        ops3 in prop::collection::vec(arbitrary_rga_op(), 1..15),
+        ops4 in prop::collection::vec(arbitrary_rga_op(), 1..15),
+    ) {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        let user3 = KeyPair::generate();
+        let user4 = KeyPair::generate();
+        
+        let mut rga1 = Rga::new();
+        let mut rga2 = Rga::new();
+        let mut rga3 = Rga::new();
+        let mut rga4 = Rga::new();
+        
+        for op in &ops1 { apply_rga_op(&mut rga1, &user1, op); }
+        for op in &ops2 { apply_rga_op(&mut rga2, &user2, op); }
+        for op in &ops3 { apply_rga_op(&mut rga3, &user3, op); }
+        for op in &ops4 { apply_rga_op(&mut rga4, &user4, op); }
+        
+        // Merge in different orders - all should produce same result
+        let mut final1 = rga1.clone();
+        final1.merge(&rga2);
+        final1.merge(&rga3);
+        final1.merge(&rga4);
+        
+        let mut final2 = rga4.clone();
+        final2.merge(&rga3);
+        final2.merge(&rga2);
+        final2.merge(&rga1);
+        
+        let mut final3 = rga2.clone();
+        final3.merge(&rga4);
+        final3.merge(&rga1);
+        final3.merge(&rga3);
+        
+        prop_assert_eq!(final1.to_string(), final2.to_string());
+        prop_assert_eq!(final2.to_string(), final3.to_string());
+    }
+
+    /// Chain merge: A -> B -> C -> D, verify associativity
+    #[test]
+    fn chain_merge_associativity(
+        ops1 in prop::collection::vec(arbitrary_rga_op(), 1..20),
+        ops2 in prop::collection::vec(arbitrary_rga_op(), 1..20),
+        ops3 in prop::collection::vec(arbitrary_rga_op(), 1..20),
+    ) {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        let user3 = KeyPair::generate();
+        
+        let mut rga1 = Rga::new();
+        let mut rga2 = Rga::new();
+        let mut rga3 = Rga::new();
+        
+        for op in &ops1 { apply_rga_op(&mut rga1, &user1, op); }
+        for op in &ops2 { apply_rga_op(&mut rga2, &user2, op); }
+        for op in &ops3 { apply_rga_op(&mut rga3, &user3, op); }
+        
+        // ((A merge B) merge C)
+        let mut left = rga1.clone();
+        left.merge(&rga2);
+        left.merge(&rga3);
+        
+        // (A merge (B merge C))
+        let mut bc = rga2.clone();
+        bc.merge(&rga3);
+        let mut right = rga1.clone();
+        right.merge(&bc);
+        
+        prop_assert_eq!(left.to_string(), right.to_string());
+    }
+
+    /// Repeated merges should be idempotent
+    #[test]
+    fn repeated_merge_idempotent(
+        ops1 in prop::collection::vec(arbitrary_rga_op(), 1..30),
+        ops2 in prop::collection::vec(arbitrary_rga_op(), 1..30),
+    ) {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        
+        let mut rga1 = Rga::new();
+        let mut rga2 = Rga::new();
+        
+        for op in &ops1 { apply_rga_op(&mut rga1, &user1, op); }
+        for op in &ops2 { apply_rga_op(&mut rga2, &user2, op); }
+        
+        let mut merged = rga1.clone();
+        merged.merge(&rga2);
+        let after_first = merged.to_string();
+        
+        // Merge again - should be no-op
+        merged.merge(&rga2);
+        let after_second = merged.to_string();
+        
+        // Merge rga1 again - should be no-op
+        merged.merge(&rga1);
+        let after_third = merged.to_string();
+        
+        prop_assert_eq!(&after_first, &after_second);
+        prop_assert_eq!(&after_second, &after_third);
+    }
+}
+
+// =============================================================================
+// Interleaving resistance tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Concurrent inserts at same position should not interleave
+    /// (YATA/FugueMax property: runs stay together)
+    #[test]
+    fn no_interleaving_concurrent_inserts(
+        content1 in prop::collection::vec(b'A'..=b'Z', 5..20),
+        content2 in prop::collection::vec(b'a'..=b'z', 5..20),
+    ) {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        
+        // Both users insert at position 0
+        let mut rga1 = Rga::new();
+        rga1.insert(&user1.key_pub, 0, &content1);
+        
+        let mut rga2 = Rga::new();
+        rga2.insert(&user2.key_pub, 0, &content2);
+        
+        let mut merged = rga1.clone();
+        merged.merge(&rga2);
+        
+        let result = merged.to_string();
+        let s1: String = content1.iter().map(|&c| c as char).collect();
+        let s2: String = content2.iter().map(|&c| c as char).collect();
+        
+        // Result should be either s1+s2 or s2+s1, never interleaved
+        let valid = result == format!("{}{}", s1, s2) || result == format!("{}{}", s2, s1);
+        prop_assert!(valid, "Interleaving detected: {:?} is neither {:?}+{:?} nor {:?}+{:?}", 
+                    result, s1, s2, s2, s1);
+    }
+
+    /// Sequential typing by one user should never be split by concurrent edits
+    #[test]
+    fn sequential_typing_preserved(
+        prefix in prop::collection::vec(b'a'..=b'z', 5..15),
+        suffix in prop::collection::vec(b'a'..=b'z', 5..15),
+        interrupt in prop::collection::vec(b'0'..=b'9', 3..10),
+    ) {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        
+        // User1 types prefix, then suffix
+        let mut rga1 = Rga::new();
+        rga1.insert(&user1.key_pub, 0, &prefix);
+        let pos = rga1.len();
+        rga1.insert(&user1.key_pub, pos, &suffix);
+        
+        // User2 independently inserts at position 0
+        let mut rga2 = Rga::new();
+        rga2.insert(&user2.key_pub, 0, &interrupt);
+        
+        let mut merged = rga1.clone();
+        merged.merge(&rga2);
+        
+        let result = merged.to_string();
+        let user1_text: String = prefix.iter().chain(suffix.iter()).map(|&c| c as char).collect();
+        
+        // User1's text should appear as a contiguous substring
+        prop_assert!(result.contains(&user1_text), 
+                    "User1's text {:?} was split in result {:?}", user1_text, result);
+    }
+}
+
+// =============================================================================
+// Edge cases and stress tests  
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    /// Many users, small edits
+    #[test]
+    fn many_users_small_edits(
+        num_users in 3usize..8,
+        ops_per_user in 5usize..15,
+    ) {
+        let users: Vec<KeyPair> = (0..num_users).map(|_| KeyPair::generate()).collect();
+        let mut rgas: Vec<Rga> = (0..num_users).map(|_| Rga::new()).collect();
+        
+        // Each user does some edits
+        for (i, rga) in rgas.iter_mut().enumerate() {
+            for j in 0..ops_per_user {
+                let content = format!("u{}e{}", i, j);
+                let pos = if rga.len() == 0 { 0 } else { rga.len() / 2 };
+                rga.insert(&users[i].key_pub, pos, content.as_bytes());
+            }
+        }
+        
+        // Merge all into first, then all into last
+        let mut final1 = rgas[0].clone();
+        for rga in &rgas[1..] {
+            final1.merge(rga);
+        }
+        
+        let mut final2 = rgas[num_users - 1].clone();
+        for rga in rgas[..num_users-1].iter().rev() {
+            final2.merge(rga);
+        }
+        
+        prop_assert_eq!(final1.to_string(), final2.to_string());
+    }
+
+    /// Deep nesting: each insert is after the previous
+    #[test]
+    fn deep_origin_chain(
+        depth in 10usize..30,
+    ) {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        
+        // User1 builds a deep chain
+        let mut rga1 = Rga::new();
+        for i in 0..depth {
+            let content = format!("{}", (b'a' + (i % 26) as u8) as char);
+            rga1.insert(&user1.key_pub, rga1.len(), content.as_bytes());
+        }
+        
+        // User2 inserts at various points
+        let mut rga2 = Rga::new();
+        rga2.insert(&user2.key_pub, 0, b"XXX");
+        
+        let mut m12 = rga1.clone();
+        m12.merge(&rga2);
+        
+        let mut m21 = rga2.clone();
+        m21.merge(&rga1);
+        
+        prop_assert_eq!(m12.to_string(), m21.to_string());
+    }
+
+    /// Alternating inserts between two users at same position
+    #[test]
+    fn alternating_inserts(
+        rounds in 5usize..15,
+    ) {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        
+        let mut rga1 = Rga::new();
+        let mut rga2 = Rga::new();
+        
+        // Simulate alternating edits
+        for i in 0..rounds {
+            if i % 2 == 0 {
+                let pos = rga1.len() / 2;
+                rga1.insert(&user1.key_pub, pos.min(rga1.len()), b"A");
+            } else {
+                let pos = rga2.len() / 2;
+                rga2.insert(&user2.key_pub, pos.min(rga2.len()), b"B");
+            }
+        }
+        
+        let mut m12 = rga1.clone();
+        m12.merge(&rga2);
+        
+        let mut m21 = rga2.clone();
+        m21.merge(&rga1);
+        
+        prop_assert_eq!(m12.to_string(), m21.to_string());
+    }
+}
+
+// =============================================================================
+// Version and snapshot tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Versions should capture document state correctly
+    #[test]
+    fn version_captures_state(
+        ops in prop::collection::vec(arbitrary_rga_op(), 5..30),
+    ) {
+        let user = KeyPair::generate();
+        let mut rga = Rga::new();
+        
+        for op in ops.iter() {
+            apply_rga_op(&mut rga, &user, op);
+        }
+        
+        // Take version after all ops
+        let version = rga.version();
+        
+        // Version should reflect state when taken
+        prop_assert_eq!(rga.to_string_at(&version), rga.to_string());
+        prop_assert_eq!(rga.len_at(&version), rga.len());
+    }
+}
+
+// =============================================================================
+// Deletion edge cases
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Delete then insert at same position
+    #[test]
+    fn delete_then_insert_same_position(
+        initial in prop::collection::vec(b'a'..=b'z', 10..30),
+        delete_start_pct in 0.2f64..0.8,
+        delete_len in 1usize..5,
+        insert_content in prop::collection::vec(b'A'..=b'Z', 1..10),
+    ) {
+        let user = KeyPair::generate();
+        let _user2 = KeyPair::generate(); // For future concurrent tests
+        let mut rga = Rga::new();
+        
+        rga.insert(&user.key_pub, 0, &initial);
+        
+        let delete_start = ((delete_start_pct * initial.len() as f64) as u64).min(rga.len().saturating_sub(1));
+        let delete_len = (delete_len as u64).min(rga.len() - delete_start);
+        
+        if delete_len > 0 {
+            rga.delete(delete_start, delete_len);
+        }
+        
+        // Insert at the deletion point
+        rga.insert(&user.key_pub, delete_start.min(rga.len()), &insert_content);
+        
+        check_rga_invariants(&rga)?;
+    }
+
+    /// Concurrent delete of same region
+    #[test]
+    fn concurrent_delete_same_region(
+        initial in prop::collection::vec(b'a'..=b'z', 20..40),
+        delete_start_pct in 0.2f64..0.6,
+        delete_len in 3usize..8,
+    ) {
+        let user1 = KeyPair::generate();
+        let _user2 = KeyPair::generate();
+        
+        // Both start with same content
+        let mut rga1 = Rga::new();
+        rga1.insert(&user1.key_pub, 0, &initial);
+        let mut rga2 = rga1.clone();
+        
+        let delete_start = ((delete_start_pct * initial.len() as f64) as u64).min(rga1.len().saturating_sub(1));
+        let delete_len = (delete_len as u64).min(rga1.len() - delete_start);
+        
+        if delete_len > 0 {
+            // Both delete the same region
+            rga1.delete(delete_start, delete_len);
+            rga2.delete(delete_start, delete_len);
+        }
+        
+        let mut m12 = rga1.clone();
+        m12.merge(&rga2);
+        
+        let mut m21 = rga2.clone();
+        m21.merge(&rga1);
+        
+        prop_assert_eq!(m12.to_string(), m21.to_string());
+    }
+
+    /// One user deletes what another user inserted into
+    #[test]
+    fn delete_around_concurrent_insert(
+        initial in prop::collection::vec(b'a'..=b'z', 20..40),
+        insert_content in prop::collection::vec(b'0'..=b'9', 3..8),
+    ) {
+        let user1 = KeyPair::generate();
+        let user2 = KeyPair::generate();
+        
+        // Both start with same content
+        let mut rga1 = Rga::new();
+        rga1.insert(&user1.key_pub, 0, &initial);
+        let mut rga2 = rga1.clone();
+        
+        // User1 inserts in the middle
+        let insert_pos = initial.len() as u64 / 2;
+        rga1.insert(&user1.key_pub, insert_pos, &insert_content);
+        
+        // User2 deletes a region that includes the insertion point
+        let delete_start = insert_pos.saturating_sub(3);
+        let delete_len = 6u64.min(rga2.len() - delete_start);
+        if delete_len > 0 {
+            rga2.delete(delete_start, delete_len);
+        }
+        
+        let mut m12 = rga1.clone();
+        m12.merge(&rga2);
+        
+        let mut m21 = rga2.clone();
+        m21.merge(&rga1);
+        
+        // After merge, user1's insert should survive (insert wins over delete)
+        prop_assert_eq!(m12.to_string(), m21.to_string());
+        
+        // The inserted content should be present
+        let result = m12.to_string();
+        let insert_str: String = insert_content.iter().map(|&c| c as char).collect();
+        prop_assert!(result.contains(&insert_str), 
+                    "Inserted content {:?} should survive in {:?}", insert_str, result);
     }
 }
