@@ -941,7 +941,7 @@ impl Rga {
     /// Attempts to coalesce with the preceding span if possible.
     /// Uses cursor caching for O(1) sequential typing with chunk location caching.
     #[inline]
-    fn insert_span_at_pos_optimized(&mut self, span: Span, pos: u64) {
+    fn insert_span_at_pos_optimized(&mut self, mut span: Span, pos: u64) {
         let span_len = span.visible_len() as u64;
         let doc_len = self.spans.total_weight();
 
@@ -1097,9 +1097,13 @@ impl Rga {
             return;
         }
 
-        // Can't coalesce - use RGA ordering to find correct position among siblings
-        // This ensures merge commutativity even when local inserts create siblings
-        self.insert_span_rga(span, Some(left_origin_id), right_origin_id);
+        // Can't coalesce - use RGA ordering to find correct position.
+        // 
+        // We pass the known origin position (prev_idx) to avoid redundant lookup.
+        // YATA ordering is still needed because:
+        // 1. There might be siblings (other spans with same left_origin)
+        // 2. Concurrent edits during merge require consistent ordering
+        self.insert_span_rga_with_hint(span, left_origin_id, right_origin_id, prev_idx);
         self.cursor_cache.invalidate();
     }
 
@@ -1635,6 +1639,117 @@ impl Rga {
         };
 
         self.spans.insert(insert_idx, span, span_len);
+    }
+
+    /// Insert a span with a hint for the origin position.
+    /// 
+    /// This is an optimization for local inserts where we already know the origin
+    /// span's index from a previous lookup. Avoids redundant O(n) find_span_by_id.
+    fn insert_span_rga_with_hint(
+        &mut self,
+        mut span: Span,
+        left_origin: ItemId,
+        right_origin: Option<ItemId>,
+        origin_idx_hint: usize,
+    ) {
+        let span_len = span.visible_len() as u64;
+
+        // Set origins on the span
+        let origin_user_idx = self.ensure_user(&left_origin.user);
+        span.set_origin(OriginId::some(origin_user_idx, left_origin.seq as u32));
+        if let Some(ref ro) = right_origin {
+            let ro_user_idx = self.ensure_user(&ro.user);
+            span.set_right_origin(OriginId::some(ro_user_idx, ro.seq as u32));
+        }
+
+        // Get span info for YATA comparison
+        let span_user = *self.users.get_key(span.user_idx).unwrap();
+        let span_right_origin = span.right_origin();
+        let span_has_right_origin = span.has_right_origin();
+
+        // Use the hint to find position, avoiding find_span_by_id
+        let insert_idx = self.find_position_with_origin_hint(
+            &left_origin,
+            origin_idx_hint,
+            span_user,
+            span.seq,
+            span_right_origin,
+            span_has_right_origin,
+        );
+
+        self.spans.insert(insert_idx, span, span_len);
+    }
+
+    /// Find insertion position using a hint for the origin index.
+    /// 
+    /// Like find_position_with_origin but skips the find_span_by_id call.
+    fn find_position_with_origin_hint(
+        &mut self,
+        origin_id: &ItemId,
+        origin_idx: usize,
+        span_user: KeyPub,
+        span_seq: u32,
+        span_right_origin: OriginId,
+        span_has_right_origin: bool,
+    ) -> usize {
+        // Split origin span if needed
+        let origin_span = self.spans.get(origin_idx).unwrap();
+        let offset_in_span = (origin_id.seq as u32) - origin_span.seq;
+        let mut idx_after_origin = origin_idx + 1;
+        
+        if offset_in_span < origin_span.len - 1 {
+            let mut existing = self.spans.remove(origin_idx);
+            let right = existing.split(offset_in_span + 1);
+            self.spans.insert(origin_idx, existing, existing.visible_len() as u64);
+            self.spans.insert(origin_idx + 1, right, right.visible_len() as u64);
+            idx_after_origin = origin_idx + 1; // Insert position is after left half
+        }
+        
+        // Initialize subtree tracking with just the origin
+        let origin_user_idx = self.ensure_user(&origin_id.user);
+        let mut subtree_ranges: Vec<(u16, u32, u32)> = vec![
+            (origin_user_idx, origin_id.seq as u32, origin_id.seq as u32)
+        ];
+        
+        let mut pos = idx_after_origin;
+        
+        while pos < self.spans.len() {
+            let other = self.spans.get(pos).unwrap();
+            
+            // Check if this span is a sibling
+            if !self.is_sibling(other, origin_id.user, origin_id.seq) {
+                // Not a sibling - check if it's a descendant
+                if other.has_origin() {
+                    let other_origin = other.origin();
+                    if Self::origin_in_subtree(other_origin, &subtree_ranges) {
+                        Self::add_to_subtree(other, &mut subtree_ranges);
+                        pos += 1;
+                        continue;
+                    }
+                }
+                // Not in subtree - we've exited
+                break;
+            }
+            
+            // It's a sibling - use YATA comparison
+            let order = self.yata_compare(
+                span_right_origin,
+                span_has_right_origin,
+                span_user,
+                span_seq,
+                other,
+            );
+            
+            match order {
+                YataOrder::Before => break,
+                YataOrder::After => {
+                    Self::add_to_subtree(other, &mut subtree_ranges);
+                    pos = self.skip_subtree(pos);
+                }
+            }
+        }
+        
+        pos
     }
 
     /// Delete a single item by its ID.
