@@ -310,3 +310,9 @@ goals:
 - we need to be able to persist to disk. I think we could do something simple like a sqlite database per document. we would do the blob store elsewhere. there would be a trait perhaps very generic for writing operations; the network and the disk could just plug into this trait. The table has like an admin singleton and a table per core. admin also has a permissions table; admin's log is scanned for membership set events; membership set events are determined by the timestamps of the logs of admin. so if someone is removed but not aware of it if they try editing their future edits will be dropped, even if they arrive before the admin announced their removal. 
 - we would have to implement some transport. I think http server, quic, and websockets would be a good basis.
 - final step would be wasm / js integration. end goal would be to be able to ship this binary to client and stream back edits.
+
+---
+
+Can you write a fuzzing-style test/benchmark of N users (n = 2..=10) randomly editing a document up to 100kb? Inserts deletions, moves, etc. use a-z and spaces, weighted by frequency. bias towards conflicting edits and edge cases (inserting after something which was just deleted by another user, inserting in the same place, etc). run from the perspective of each user and exchange edits with random delays. ensure all are consistent. Do this state machine style, (pick which person, pick to merge or to write, merge what they haven't seen yet, etc.)
+
+Can you also test versioning more explicitly? Suppose a user is editing a document takes a version at a point in time, along with a string snapshot. suppose they and another user continue editing the document. If the first user sends the version id to the second user, and the second user takes a string snapshot at that version, are they the same?

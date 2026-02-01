@@ -38,9 +38,6 @@ pub enum Op {
     Insert {
         /// The item this content is inserted after (None = beginning).
         origin: Option<ItemId>,
-        /// The item that was immediately to the right when this was inserted (None = end).
-        /// This is needed for correct merge commutativity (Yjs/YATA/Fugue approach).
-        right_origin: Option<ItemId>,
         /// Starting sequence number for this user.
         seq: u64,
         /// Length of the inserted content.
@@ -77,10 +74,10 @@ pub struct OpBlock {
 
 impl OpBlock {
     /// Create an insert operation block.
-    pub fn insert(origin: Option<ItemId>, right_origin: Option<ItemId>, seq: u64, content: Vec<u8>) -> OpBlock {
+    pub fn insert(origin: Option<ItemId>, seq: u64, content: Vec<u8>) -> OpBlock {
         let len = content.len() as u64;
         return OpBlock {
-            op: Op::Insert { origin, right_origin, seq, len },
+            op: Op::Insert { origin, seq, len },
             content,
         };
     }
@@ -150,12 +147,11 @@ mod tests {
 
     #[test]
     fn insert_block() {
-        let block = OpBlock::insert(None, None, 0, b"hello".to_vec());
+        let block = OpBlock::insert(None, 0, b"hello".to_vec());
 
         match &block.op {
-            Op::Insert { origin, right_origin, seq, len } => {
+            Op::Insert { origin, seq, len } => {
                 assert!(origin.is_none());
-                assert!(right_origin.is_none());
                 assert_eq!(*seq, 0);
                 assert_eq!(*len, 5);
             }
@@ -188,8 +184,8 @@ mod tests {
         let bob = KeyPair::generate();
 
         let mut log = OpLog::new();
-        log.push(alice.key_pub.clone(), OpBlock::insert(None, None, 0, b"hello".to_vec()));
-        log.push(bob.key_pub.clone(), OpBlock::insert(None, None, 0, b"world".to_vec()));
+        log.push(alice.key_pub.clone(), OpBlock::insert(None, 0, b"hello".to_vec()));
+        log.push(bob.key_pub.clone(), OpBlock::insert(None, 0, b"world".to_vec()));
 
         assert_eq!(log.ops().len(), 2);
     }
