@@ -18,8 +18,7 @@
 //! To test a new implementation, add it to the `test_all_implementations!`
 //! macro at the bottom of this file.
 
-use std::hash::Hash;
-use together::crdt::rga_trait::Rga;
+use pedagogy::rga_trait::Rga;
 
 /// Test context providing user IDs and helper methods.
 pub struct TestContext<U> {
@@ -360,7 +359,7 @@ pub fn test_unicode<R: Rga>(make_empty: impl Fn() -> R, user: R::UserId) {
     let mut rga = make_empty();
     
     // Note: Rga works with bytes, not characters
-    // UTF-8 encoding of emoji: 🎉 = 4 bytes
+    // UTF-8 encoding of emoji: flag = 4 bytes
     let emoji = "🎉".as_bytes();
     rga.insert(&user, 0, emoji);
     
@@ -581,14 +580,14 @@ macro_rules! run_conformance_tests {
 // Tests for implementations
 // =============================================================================
 
-use together::crdt::cola::ColaRga;
-use together::crdt::diamond::DiamondRga;
-use together::crdt::json_joy::JsonJoyRga;
-use together::crdt::loro::LoroRga;
-use together::crdt::rga_optimized::OptimizedRga;
-use together::crdt::yjs::YjsRga;
-use together::key::KeyPair;
-use together::key::KeyPub;
+use pedagogy::cola::ColaRga;
+use pedagogy::diamond::DiamondRga;
+use pedagogy::json_joy::JsonJoyRga;
+use pedagogy::loro::LoroRga;
+use pedagogy::rga_optimized::OptimizedRga;
+use pedagogy::yjs::YjsRga;
+use pedagogy::key::KeyPair;
+use pedagogy::key::KeyPub;
 
 fn make_yjs_rga() -> YjsRga {
     return YjsRga::new();

@@ -31,9 +31,9 @@
 //! # Example
 //!
 //! ```
-//! use together::crdt::json_joy::JsonJoyRga;
-//! use together::crdt::rga_trait::Rga;
-//! use together::key::KeyPair;
+//! use pedagogy::json_joy::JsonJoyRga;
+//! use pedagogy::rga_trait::Rga;
+//! use pedagogy::key::KeyPair;
 //!
 //! let user = KeyPair::generate();
 //! let mut doc = JsonJoyRga::new();

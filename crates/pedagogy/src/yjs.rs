@@ -15,9 +15,9 @@
 //! # Example
 //!
 //! ```
-//! use together::crdt::yjs::YjsRga;
-//! use together::crdt::rga_trait::Rga;
-//! use together::key::KeyPair;
+//! use pedagogy::yjs::YjsRga;
+//! use pedagogy::rga_trait::Rga;
+//! use pedagogy::key::KeyPair;
 //!
 //! let user = KeyPair::generate();
 //! let mut doc = YjsRga::new();

@@ -4,19 +4,14 @@
 // driver = "Isaac Clayton"
 
 //! CRDT primitives for collaborative data structures.
+//!
+//! This module contains the production RGA implementation.
+//! For educational CRDT implementations and alternative algorithms,
+//! see the `pedagogy` crate.
 
 mod btree_list;
-pub mod cola;
-pub mod diamond;
-pub mod json_joy;
-pub mod log_integration;
-pub mod loro;
 pub mod op;
-pub mod primitives;
 pub mod rga;
-pub mod rga_optimized;
-pub mod rga_trait;
-pub mod yjs;
 
 /// A CRDT is a data type with a merge operator that is commutative,
 /// associative, and idempotent.

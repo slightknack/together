@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "crates/pedagogy"]
+exclude = ["comparisons/criterion"]
+resolver = "3"
+
 [package]
 name = "together"
 version = "0.1.0"

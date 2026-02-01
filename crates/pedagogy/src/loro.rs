@@ -3,75 +3,49 @@
 // modified = 2026-02-01
 // driver = "Isaac Clayton"
 
-//! Optimized RGA combining best techniques from all implementations.
+//! Loro-style RGA using the Fugue algorithm.
 //!
-//! This implementation synthesizes the best ideas from:
-//! - **LoroRga (Fugue algorithm)**: Best anti-interleaving semantics
-//! - **DiamondRga (B-tree)**: O(log n) operations
-//! - **Separate content storage**: Avoids duplication during merges
+//! This implementation is inspired by the Loro library, which uses the Fugue
+//! algorithm for text sequences. Fugue minimizes interleaving in concurrent
+//! edits through a dual-origin approach.
+//!
+//! # Fugue Algorithm
+//!
+//! The key insight of Fugue is that each character stores two origins:
+//! - `origin_left`: The ID of the character immediately to the left when inserted
+//! - `origin_right`: The ID of the character immediately to the right when inserted
+//!
+//! When concurrent inserts happen at the same position, Fugue first resolves
+//! conflicts using `origin_left`. If there is still ambiguity (same left origin),
+//! it uses `origin_right` to break ties. This prevents interleaving of concurrent
+//! text passages.
 //!
 //! # Architecture
 //!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────────┐
-//! │                         OptimizedRga                                │
-//! ├─────────────────────────────────────────────────────────────────────┤
-//! │  spans: BTreeList<Span>    <- Weighted B-tree for O(log n) access   │
-//! │  users: UserTable          <- KeyPub -> u16 index                   │
-//! │  user_content: Vec<...>    <- Per-user content buffers              │
-//! │  clock: LamportClock       <- Ordering                              │
-//! └─────────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Key Optimizations
-//!
-//! 1. **B-tree Storage**: O(log n) position lookups via weighted B-tree.
-//!
-//! 2. **Separate Content Storage**: Content bytes are stored per-user in
-//!    append-only buffers. Spans reference content by offset, avoiding
-//!    duplication during merges.
-//!
-//! 3. **Fugue Algorithm**: Dual-origin conflict resolution prevents
-//!    character interleaving in concurrent edits.
-//!
-//! 4. **Compact User IDs**: Users are mapped to 16-bit indices, reducing
-//!    per-span memory overhead.
-//!
-//! # Complexity
-//!
-//! | Operation       | Average    | Worst Case | Notes                    |
-//! |-----------------|------------|------------|--------------------------|
-//! | Insert (local)  | O(log n)   | O(log n)   | B-tree weighted lookup   |
-//! | Insert (remote) | O(n)       | O(n)       | Linear scan for origin   |
-//! | Delete          | O(log n)   | O(log n)   | B-tree weighted lookup   |
-//! | Merge           | O(m * n)   | O(m * n)   | m = ops in other doc     |
-//! | Position lookup | O(log n)   | O(log n)   | B-tree weighted lookup   |
+//! - Uses B-tree based storage for O(log n) operations
+//! - Run-length encoding / span coalescing for memory efficiency
+//! - Separates content storage from CRDT metadata
 //!
 //! # Example
 //!
 //! ```
-//! use together::crdt::rga_optimized::OptimizedRga;
-//! use together::crdt::rga_trait::Rga;
-//! use together::key::KeyPair;
+//! use pedagogy::loro::LoroRga;
+//! use pedagogy::rga_trait::Rga;
+//! use pedagogy::key::KeyPair;
 //!
 //! let user = KeyPair::generate();
-//! let mut doc = OptimizedRga::new();
+//! let mut doc = LoroRga::new();
 //!
-//! // Sequential typing is O(1) amortized due to cursor caching
-//! for (i, c) in "Hello, World!".bytes().enumerate() {
-//!     doc.insert(&user.key_pub, i as u64, &[c]);
-//! }
+//! doc.insert(&user.key_pub, 0, b"Hello");
+//! doc.insert(&user.key_pub, 5, b" World");
+//! assert_eq!(doc.to_string(), "Hello World");
 //!
-//! assert_eq!(doc.to_string(), "Hello, World!");
-//!
-//! // Deletes are O(log n)
-//! doc.delete(5, 8);  // Delete ", World"
-//! assert_eq!(doc.to_string(), "Hello!");
+//! doc.delete(5, 6);
+//! assert_eq!(doc.to_string(), "Hello");
 //! ```
 
 use crate::key::KeyPub;
 use super::btree_list::BTreeList;
-use super::log_integration::{OpLog, Operation, OperationId};
 use super::primitives::{UserTable, LamportClock, UserIdx};
 use super::rga_trait::Rga;
 
@@ -81,17 +55,14 @@ use super::rga_trait::Rga;
 
 /// A span of consecutive characters from one user.
 ///
-/// Spans are the core unit of storage. Each span represents a contiguous
-/// sequence of characters from a single user, with shared origins.
+/// Loro uses span coalescing to reduce memory usage. Consecutive characters
+/// from the same user with compatible origins are merged into single spans.
 ///
-/// # Fields
-///
-/// - `user_idx`: Compact index into the user table (2 bytes vs 32 for KeyPub)
-/// - `seq`: Starting sequence number for this span
-/// - `len`: Number of characters in this span
-/// - `origin_left/right`: Fugue dual-origin IDs for conflict resolution
-/// - `deleted`: Tombstone flag
-/// - `content_offset`: Index into user's content buffer
+/// Each span stores:
+/// - User and sequence range
+/// - Left and right origins (for Fugue conflict resolution)
+/// - Content offset (into user's content buffer)
+/// - Deletion state (using delete counter, not tombstone)
 #[derive(Clone, Debug)]
 struct Span {
     /// User who created this span.
@@ -100,13 +71,14 @@ struct Span {
     seq: u32,
     /// Number of characters in this span.
     len: u32,
-    /// Left origin: ID of character to the left when inserted.
-    /// None (represented as user_idx.is_none()) means inserted at beginning.
+    /// Left origin: what was to the left when this was inserted.
+    /// None means inserted at the beginning.
     origin_left: Option<(UserIdx, u32)>,
-    /// Right origin: ID of character to the right when inserted.
-    /// None means inserted at end.
+    /// Right origin: what was to the right when this was inserted.
+    /// None means inserted at the end.
     origin_right: Option<(UserIdx, u32)>,
-    /// Whether this span is deleted (tombstone).
+    /// Whether this span is deleted.
+    /// Loro uses delete counters, but for simplicity we use a boolean.
     deleted: bool,
     /// Offset into the user's content buffer.
     content_offset: u32,
@@ -133,7 +105,7 @@ impl Span {
     }
 
     /// Get the visible length (0 if deleted).
-    #[inline(always)]
+    #[inline]
     fn visible_len(&self) -> u64 {
         if self.deleted {
             return 0;
@@ -142,15 +114,9 @@ impl Span {
     }
 
     /// Check if this span contains the given (user_idx, seq).
-    #[inline(always)]
+    #[inline]
     fn contains(&self, user_idx: UserIdx, seq: u32) -> bool {
         return self.user_idx == user_idx && seq >= self.seq && seq < self.seq + self.len;
-    }
-
-    /// Get the ending sequence number (exclusive).
-    #[inline(always)]
-    fn seq_end(&self) -> u32 {
-        return self.seq + self.len;
     }
 
     /// Split this span at the given offset, returning the right part.
@@ -176,43 +142,16 @@ impl Span {
         self.len = offset;
         return right;
     }
-
-    /// Check if this span can be coalesced with the next span.
-    ///
-    /// Two spans can be coalesced if:
-    /// - Same user
-    /// - Consecutive sequence numbers
-    /// - Consecutive content offsets
-    /// - Same deletion state
-    /// - Next span's left origin points to end of this span
-    #[inline]
-    fn can_coalesce_with(&self, next: &Span) -> bool {
-        return self.user_idx == next.user_idx
-            && self.seq_end() == next.seq
-            && self.content_offset + self.len == next.content_offset
-            && self.deleted == next.deleted
-            && next.origin_left == Some((self.user_idx, self.seq + self.len - 1));
-    }
-
-    /// Extend this span to include the next span.
-    fn extend(&mut self, next: &Span) {
-        debug_assert!(self.can_coalesce_with(next));
-        self.len += next.len;
-        // Keep our origin_right (it stays the same conceptually, but the next
-        // span's right origin becomes ours after the merge)
-        // Actually, we keep our original origin_right - the structural
-        // relationship is maintained by the tree position.
-    }
 }
 
 // =============================================================================
 // Per-user content storage
 // =============================================================================
 
-/// Per-user content storage and sequence tracking.
+/// Per-user content storage.
 ///
-/// Each user has their own append-only content buffer. Spans reference
-/// content by offset into this buffer, avoiding duplication.
+/// Loro separates content from CRDT metadata. Each user has their own
+/// content buffer, and spans reference offsets into this buffer.
 #[derive(Clone, Debug, Default)]
 struct UserContent {
     /// The content bytes inserted by this user.
@@ -222,17 +161,18 @@ struct UserContent {
 }
 
 // =============================================================================
-// OptimizedRga
+// LoroRga
 // =============================================================================
 
-/// Optimized RGA combining best techniques from all implementations.
+/// Loro-style RGA using the Fugue algorithm.
 ///
-/// See module-level documentation for architecture and complexity analysis.
+/// Uses a B-tree for O(log n) position lookups, run-length encoded spans,
+/// and separated content storage.
 #[derive(Clone, Debug)]
-pub struct OptimizedRga {
+pub struct LoroRga {
     /// Spans in document order, stored in a B-tree weighted by visible length.
     spans: BTreeList<Span>,
-    /// User table mapping KeyPub to compact UserIdx.
+    /// User table mapping KeyPub to UserIdx.
     users: UserTable<KeyPub>,
     /// Per-user content storage.
     user_content: Vec<UserContent>,
@@ -240,16 +180,16 @@ pub struct OptimizedRga {
     clock: LamportClock,
 }
 
-impl Default for OptimizedRga {
+impl Default for LoroRga {
     fn default() -> Self {
         return Self::new();
     }
 }
 
-impl OptimizedRga {
-    /// Create a new empty OptimizedRga.
-    pub fn new() -> OptimizedRga {
-        return OptimizedRga {
+impl LoroRga {
+    /// Create a new empty LoroRga.
+    pub fn new() -> LoroRga {
+        return LoroRga {
             spans: BTreeList::new(),
             users: UserTable::new(),
             user_content: Vec::new(),
@@ -258,7 +198,6 @@ impl OptimizedRga {
     }
 
     /// Ensure a user exists and return their index.
-    #[inline]
     fn ensure_user(&mut self, user: &KeyPub) -> UserIdx {
         let idx = self.users.get_or_insert(user);
         while self.user_content.len() <= idx.0 as usize {
@@ -268,7 +207,6 @@ impl OptimizedRga {
     }
 
     /// Advance the user's next_seq to be at least the given value.
-    #[inline]
     fn advance_seq(&mut self, user_idx: UserIdx, seq: u32) {
         let state = &mut self.user_content[user_idx.0 as usize];
         if seq >= state.next_seq {
@@ -277,19 +215,14 @@ impl OptimizedRga {
     }
 
     /// Get content for a span.
-    #[inline]
     fn get_content(&self, user_idx: UserIdx, offset: u32, len: u32) -> &[u8] {
         let content = &self.user_content[user_idx.0 as usize].content;
         return &content[offset as usize..(offset + len) as usize];
     }
 
-    /// Find the span containing the given (user_idx, seq).
+    /// Find the span index containing the given (user_idx, seq).
     /// Returns (span_index, offset_within_span).
     fn find_span_by_id(&self, user_idx: UserIdx, seq: u32) -> Option<(usize, u32)> {
-        // Linear scan - same as LoroRga
-        // The ID index optimization is removed for now as it was causing issues
-        // with stale indices. A proper implementation would need to maintain
-        // index consistency during all insert/split operations.
         for (i, span) in self.spans.iter().enumerate() {
             if span.contains(user_idx, seq) {
                 let offset = seq - span.seq;
@@ -316,35 +249,20 @@ impl OptimizedRga {
     }
 
     /// Calculate total visible length.
-    #[inline]
     fn calculate_len(&self) -> u64 {
         return self.spans.total_weight();
     }
 
-    /// Split a span at the given offset.
-    fn split_span_at(&mut self, idx: usize, offset: u32) {
-        // Get the span and split it
-        let span = self.spans.get_mut(idx).unwrap();
-        let right = span.split(offset);
-        
-        // Update weight of left part
-        let left_weight = span.visible_len();
-        self.spans.update_weight(idx, left_weight);
-        
-        // Insert right part
-        let right_weight = right.visible_len();
-        self.spans.insert(idx + 1, right, right_weight);
-    }
-
     /// Insert a span using Fugue ordering rules.
     ///
-    /// The Fugue algorithm prevents interleaving by using dual origins:
+    /// The Fugue algorithm:
     /// 1. Find the left origin's position
     /// 2. Scan right through potential conflicts
-    /// 3. Apply Fugue conflict resolution:
-    ///    a. Compare by origin_left first
-    ///    b. If same, compare by origin_right
-    ///    c. If still tied, use (user_id, seq) as tiebreaker
+    /// 3. Apply Fugue conflict resolution rules:
+    ///    a. First compare by origin_left
+    ///    b. If same origin_left, compare by origin_right
+    ///    c. If same origins, use (peer_id, seq) as tiebreaker
+    /// 4. Insert at the determined position
     fn insert_span(&mut self, span: Span) {
         // Track the sequence number
         self.advance_seq(span.user_idx, span.seq + span.len - 1);
@@ -394,7 +312,19 @@ impl OptimizedRga {
             }
         };
 
-        // Fugue conflict resolution
+        // Fugue conflict resolution: scan through items between start_idx and end_idx
+        //
+        // The Fugue algorithm prevents interleaving by considering where existing items
+        // were inserted relative to our insertion point. The key insight:
+        //
+        // We scan forward from our left origin. For each existing item:
+        // - If same origin_left: compare origin_right positions, then ID
+        // - If different origin_left: check if existing's origin_left is "between"
+        //   our origin_left and origin_right (meaning it was inserted into our gap)
+        //
+        // An item whose origin_left points to something BETWEEN our origin_left and
+        // origin_right was inserted "into" the gap we're also inserting into, and
+        // forms a subtree. We need to skip over entire subtrees.
         let mut insert_idx = start_idx;
         let mut scanning = true;
 
@@ -404,35 +334,48 @@ impl OptimizedRga {
             let existing_right_origin = existing.origin_right;
 
             if span.origin_left == existing_left_origin {
-                // Same left origin - sibling insertion
+                // Same left origin - this is a sibling insertion
+                // Use origin_right to determine order
+                
                 if span.origin_right == existing_right_origin {
-                    // Same right origin too - use ID tiebreaker
+                    // Same left AND right origins - use ID as final tiebreaker
+                    // Higher ID comes first (arbitrary but consistent)
                     let new_key = self.users.get_id(span.user_idx);
                     let existing_key = self.users.get_id(existing.user_idx);
                     match (new_key, existing_key) {
                         (Some(new_k), Some(ex_k)) => {
                             if (ex_k, existing.seq) > (new_k, span.seq) {
+                                // existing has higher ID, insert before it
                                 scanning = false;
                             } else {
+                                // we have higher ID, continue scanning
                                 insert_idx += 1;
                             }
                         }
                         _ => insert_idx += 1,
                     }
                 } else {
-                    // Different right origins - compare positions
+                    // Different right origins - compare their positions
+                    // The item with the LEFTWARD right origin should be placed FIRST
+                    // (it was inserted into a "tighter" gap)
+                    //
+                    // None = no right origin = inserted at document end = rightmost position
                     let existing_ro_precedes = match (&existing_right_origin, &span.origin_right) {
-                        (None, None) => false,
-                        (None, Some(_)) => false,
-                        (Some(_), None) => true,
+                        (None, None) => false, // Both at end, equal
+                        (None, Some(_)) => false, // Existing at end, ours is left of that
+                        (Some(_), None) => true, // Existing has finite position, ours at end
                         (Some(ex_ro), Some(new_ro)) => {
                             self.origin_precedes(&Some(*ex_ro), &Some(*new_ro))
                         }
                     };
                     
                     if existing_ro_precedes {
+                        // Existing's right origin is more leftward = tighter gap
+                        // Existing comes first, continue scanning
                         insert_idx += 1;
                     } else {
+                        // Our right origin is more leftward or equal
+                        // Check if equal - if so, use ID tiebreaker
                         let origins_equal = existing_right_origin == span.origin_right;
                         if origins_equal {
                             let new_key = self.users.get_id(span.user_idx);
@@ -448,27 +391,54 @@ impl OptimizedRga {
                                 _ => insert_idx += 1,
                             }
                         } else {
+                            // Our right origin is strictly more leftward
+                            // We come first
                             scanning = false;
                         }
                     }
                 }
             } else {
                 // Different left origin
+                //
+                // Key Fugue insight: if existing's origin_left is "between" our
+                // origin_left and origin_right, then existing was inserted into
+                // a child subtree and we should skip over it (continue scanning).
+                //
+                // "Between" means: existing's origin_left is at a position that is
+                // after our origin_left but before (or at) our origin_right.
+                //
+                // If existing's origin_left is at or before our origin_left,
+                // then existing is a sibling or ancestor - stop scanning.
+                
                 let existing_origin_after_ours = !self.origin_precedes(&existing_left_origin, &span.origin_left)
                     && existing_left_origin != span.origin_left;
                 
                 if existing_origin_after_ours {
+                    // Existing's origin_left is AFTER our origin_left
+                    // This means existing was inserted into a position that came after
+                    // where we're inserting - it belongs to a child subtree
+                    // 
+                    // But we also need to check: is it before our origin_right?
+                    // If existing's origin_left is at or after our origin_right,
+                    // then it's NOT in our subtree - we should stop.
                     let in_our_subtree = match &span.origin_right {
-                        None => true,
-                        Some(ro) => self.origin_precedes(&existing_left_origin, &Some(*ro)),
+                        None => true, // No right boundary, everything after is in subtree
+                        Some(ro) => {
+                            // Check if existing's origin_left is before our origin_right
+                            self.origin_precedes(&existing_left_origin, &Some(*ro))
+                        }
                     };
                     
                     if in_our_subtree {
+                        // Existing is in a child subtree - skip over it
                         insert_idx += 1;
                     } else {
+                        // Existing is past our right boundary - stop
                         scanning = false;
                     }
                 } else {
+                    // Existing's origin_left is at or before our origin_left
+                    // This is a sibling or ancestor - stop scanning
                     scanning = false;
                 }
             }
@@ -479,7 +449,24 @@ impl OptimizedRga {
         self.spans.insert(insert_idx, span, weight);
     }
 
+    /// Split a span at the given offset.
+    fn split_span_at(&mut self, idx: usize, offset: u32) {
+        let span = self.spans.get_mut(idx).unwrap();
+        let right = span.split(offset);
+        
+        // Update weight of left part
+        let left_weight = span.visible_len();
+        self.spans.update_weight(idx, left_weight);
+        
+        // Insert right part
+        let right_weight = right.visible_len();
+        self.spans.insert(idx + 1, right, right_weight);
+    }
+
     /// Check if origin_a precedes origin_b in document order.
+    ///
+    /// This is used when items have different left origins to determine
+    /// their relative order.
     fn origin_precedes(
         &self,
         origin_a: &Option<(UserIdx, u32)>,
@@ -498,14 +485,15 @@ impl OptimizedRga {
                         }
                         return off_a < off_b;
                     }
-                    (None, Some(_)) => true,
+                    (None, Some(_)) => true, // Missing origin treated as beginning
                     (Some(_), None) => false,
                     (None, None) => {
+                        // Both origins not found - compare by global ID
                         let key_a = self.users.get_id(*ua);
                         let key_b = self.users.get_id(*ub);
                         match (key_a, key_b) {
                             (Some(ka), Some(kb)) => (ka, sa) < (kb, sb),
-                            _ => sa < sb,
+                            _ => sa < sb, // Fallback
                         }
                     }
                 }
@@ -572,11 +560,11 @@ impl OptimizedRga {
         }
     }
 
-    /// Map an origin from another OptimizedRga to this one.
+    /// Map an origin from another LoroRga to this one.
     fn map_origin(
         &mut self,
         origin: &Option<(UserIdx, u32)>,
-        other: &OptimizedRga,
+        other: &LoroRga,
     ) -> Option<(UserIdx, u32)> {
         let (other_user_idx, seq) = (*origin)?;
         let other_user = other.users.get_id(other_user_idx)?;
@@ -586,10 +574,9 @@ impl OptimizedRga {
         }
         return Some((our_user_idx, seq));
     }
-
 }
 
-impl Rga for OptimizedRga {
+impl Rga for LoroRga {
     type UserId = KeyPub;
 
     fn insert(&mut self, user: &Self::UserId, pos: u64, content: &[u8]) {
@@ -785,134 +772,6 @@ impl Rga for OptimizedRga {
     }
 }
 
-// =============================================================================
-// OpLog Implementation
-// =============================================================================
-
-impl OpLog for OptimizedRga {
-    fn export_operations(&self) -> Vec<Operation> {
-        let mut ops = Vec::new();
-
-        // First, collect all insert operations
-        for span in self.spans.iter() {
-            // Get the user's public key
-            let user = match self.users.get_id(span.user_idx) {
-                Some(u) => u.clone(),
-                None => continue,
-            };
-
-            // Convert origin indices to OperationIds
-            let origin_left = span.origin_left.and_then(|(user_idx, seq)| {
-                let origin_user = self.users.get_id(user_idx)?;
-                Some(OperationId::new(origin_user.clone(), seq))
-            });
-
-            let origin_right = span.origin_right.and_then(|(user_idx, seq)| {
-                let origin_user = self.users.get_id(user_idx)?;
-                Some(OperationId::new(origin_user.clone(), seq))
-            });
-
-            // Get the content
-            let content = self.get_content(span.user_idx, span.content_offset, span.len).to_vec();
-
-            // Create insert operation
-            let insert_op = Operation::insert(
-                user.clone(),
-                span.seq,
-                origin_left,
-                origin_right,
-                content,
-            );
-            ops.push(insert_op);
-        }
-
-        // Then, collect all delete operations (after inserts for causal ordering)
-        for span in self.spans.iter() {
-            if span.deleted {
-                let user = match self.users.get_id(span.user_idx) {
-                    Some(u) => u.clone(),
-                    None => continue,
-                };
-                let delete_op = Operation::delete(user, span.seq, span.len);
-                ops.push(delete_op);
-            }
-        }
-
-        return ops;
-    }
-
-    fn from_operations(ops: impl Iterator<Item = Operation>) -> Self {
-        let mut rga = OptimizedRga::new();
-
-        for op in ops {
-            rga.apply_operation(op);
-        }
-
-        return rga;
-    }
-
-    fn apply_operation(&mut self, op: Operation) -> bool {
-        match op {
-            Operation::Insert {
-                user,
-                seq,
-                origin_left,
-                origin_right,
-                content,
-            } => {
-                // Ensure user exists
-                let user_idx = self.ensure_user(&user);
-
-                // Check if we already have this operation
-                for span in self.spans.iter() {
-                    if span.user_idx == user_idx && span.contains(user_idx, seq) {
-                        return false; // Already have this operation
-                    }
-                }
-
-                // Ensure content buffer has space
-                let user_content = &mut self.user_content[user_idx.0 as usize];
-                let content_offset = user_content.content.len() as u32;
-                user_content.content.extend_from_slice(&content);
-
-                // Convert OperationIds to internal (UserIdx, seq) format
-                let left_origin = origin_left.map(|id| {
-                    let idx = self.ensure_user(&id.user);
-                    (idx, id.seq)
-                });
-
-                let right_origin = origin_right.map(|id| {
-                    let idx = self.ensure_user(&id.user);
-                    (idx, id.seq)
-                });
-
-                // Create and insert span
-                let span = Span::new(
-                    user_idx,
-                    seq,
-                    content.len() as u32,
-                    content_offset,
-                    left_origin,
-                    right_origin,
-                );
-
-                self.insert_span(span);
-                return true;
-            }
-
-            Operation::Delete {
-                target_user,
-                target_seq,
-                len,
-            } => {
-                let user_idx = self.ensure_user(&target_user);
-                self.apply_deletion_range(user_idx, target_seq, len);
-                return true;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,14 +783,14 @@ mod tests {
 
     #[test]
     fn empty_document() {
-        let rga = OptimizedRga::new();
+        let rga = LoroRga::new();
         assert_eq!(rga.len(), 0);
         assert_eq!(rga.to_string(), "");
     }
 
     #[test]
     fn insert_at_beginning() {
-        let mut rga = OptimizedRga::new();
+        let mut rga = LoroRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hello");
         assert_eq!(rga.to_string(), "hello");
@@ -940,7 +799,7 @@ mod tests {
 
     #[test]
     fn insert_at_end() {
-        let mut rga = OptimizedRga::new();
+        let mut rga = LoroRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hello");
         rga.insert(&user, 5, b" world");
@@ -949,7 +808,7 @@ mod tests {
 
     #[test]
     fn insert_in_middle() {
-        let mut rga = OptimizedRga::new();
+        let mut rga = LoroRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hd");
         rga.insert(&user, 1, b"ello worl");
@@ -957,21 +816,8 @@ mod tests {
     }
 
     #[test]
-    fn sequential_typing() {
-        let mut rga = OptimizedRga::new();
-        let user = make_user();
-        
-        // Simulate typing character by character
-        for (i, c) in "hello world".bytes().enumerate() {
-            rga.insert(&user, i as u64, &[c]);
-        }
-        
-        assert_eq!(rga.to_string(), "hello world");
-    }
-
-    #[test]
     fn delete_range() {
-        let mut rga = OptimizedRga::new();
+        let mut rga = LoroRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hello world");
         rga.delete(5, 6);
@@ -980,7 +826,7 @@ mod tests {
 
     #[test]
     fn delete_middle() {
-        let mut rga = OptimizedRga::new();
+        let mut rga = LoroRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hello");
         rga.delete(1, 3); // Delete "ell"
@@ -992,8 +838,8 @@ mod tests {
         let user1 = make_user();
         let user2 = make_user();
 
-        let mut a = OptimizedRga::new();
-        let mut b = OptimizedRga::new();
+        let mut a = LoroRga::new();
+        let mut b = LoroRga::new();
 
         a.insert(&user1, 0, b"A");
         b.insert(&user2, 0, b"B");
@@ -1012,7 +858,7 @@ mod tests {
     #[test]
     fn merge_idempotent() {
         let user = make_user();
-        let mut rga = OptimizedRga::new();
+        let mut rga = LoroRga::new();
         rga.insert(&user, 0, b"hello");
 
         let before = rga.to_string();
@@ -1027,8 +873,8 @@ mod tests {
         let user1 = make_user();
         let user2 = make_user();
 
-        let mut a = OptimizedRga::new();
-        let mut b = OptimizedRga::new();
+        let mut a = LoroRga::new();
+        let mut b = LoroRga::new();
 
         // Both insert at position 0
         a.insert(&user1, 0, b"A");
@@ -1050,9 +896,9 @@ mod tests {
         let user2 = make_user();
         let user3 = make_user();
 
-        let mut a = OptimizedRga::new();
-        let mut b = OptimizedRga::new();
-        let mut c = OptimizedRga::new();
+        let mut a = LoroRga::new();
+        let mut b = LoroRga::new();
+        let mut c = LoroRga::new();
 
         a.insert(&user1, 0, b"A");
         b.insert(&user2, 0, b"B");
@@ -1079,7 +925,7 @@ mod tests {
         let user2 = make_user();
 
         // Start with shared base "ac"
-        let mut base = OptimizedRga::new();
+        let mut base = LoroRga::new();
         base.insert(&user1, 0, b"ac");
 
         let mut a = base.clone();
@@ -1110,7 +956,7 @@ mod tests {
     fn delete_propagates_through_merge() {
         let user = make_user();
 
-        let mut a = OptimizedRga::new();
+        let mut a = LoroRga::new();
         a.insert(&user, 0, b"hello");
 
         let mut b = a.clone();
@@ -1122,23 +968,49 @@ mod tests {
     }
 
     #[test]
+    fn span_count_increases_with_splits() {
+        let user = make_user();
+        let mut rga = LoroRga::new();
+
+        rga.insert(&user, 0, b"hello");
+        let count_before = rga.span_count();
+
+        rga.delete(2, 1); // This should split the span
+        let count_after = rga.span_count();
+
+        assert!(count_after > count_before);
+    }
+
+    #[test]
     fn fugue_prevents_interleaving_with_shared_base() {
         // Test that Fugue algorithm prevents character interleaving
+        // when there is a shared base document.
+        //
+        // The Fugue guarantee: When two users concurrently insert text
+        // at the same position in a SHARED document, their text passages
+        // will NOT interleave character-by-character.
+        //
+        // Note: When two users type into completely separate empty documents
+        // (no shared base), interleaving can still occur because each user's
+        // characters have origins relative to their own local insertions.
+        
         let user1 = make_user();
         let user2 = make_user();
 
         // Start with a shared base document
-        let mut base = OptimizedRga::new();
-        base.insert(&user1, 0, b"[]");
+        let mut base = LoroRga::new();
+        base.insert(&user1, 0, b"[]");  // Shared base: "[]"
         
         let mut a = base.clone();
         let mut b = base.clone();
 
         // Both users type between '[' and ']' (position 1)
+        // User1 types "Hello" character by character
         for (i, c) in "Hello".bytes().enumerate() {
             a.insert(&user1, 1 + i as u64, &[c]);
         }
 
+        // User2 types "World" character by character at the same position
         for (i, c) in "World".bytes().enumerate() {
             b.insert(&user2, 1 + i as u64, &[c]);
         }
@@ -1149,38 +1021,12 @@ mod tests {
         let result = merged.to_string();
         
         // The result should have Hello and World as contiguous blocks
+        // (either "[HelloWorld]" or "[WorldHello]")
+        // NOT something interleaved like "[HWeolrllod]"
         assert!(
             result == "[HelloWorld]" || result == "[WorldHello]",
             "Expected non-interleaved result, got: {}",
             result
         );
-    }
-
-    #[test]
-    fn sequential_typing_long() {
-        let mut rga = OptimizedRga::new();
-        let user = make_user();
-        
-        // Sequential typing with longer text
-        let text = "The quick brown fox jumps over the lazy dog.";
-        for (i, c) in text.bytes().enumerate() {
-            rga.insert(&user, i as u64, &[c]);
-        }
-        
-        assert_eq!(rga.to_string(), text);
-    }
-
-    #[test]
-    fn span_count_with_splits() {
-        let user = make_user();
-        let mut rga = OptimizedRga::new();
-
-        rga.insert(&user, 0, b"hello");
-        let count_before = rga.span_count();
-
-        rga.delete(2, 1); // This should split the span
-        let count_after = rga.span_count();
-
-        assert!(count_after > count_before);
     }
 }

@@ -3,38 +3,33 @@
 // modified = 2026-02-01
 // driver = "Isaac Clayton"
 
-//! Loro-style RGA using the Fugue algorithm.
+//! Diamond-types style RGA implementation.
 //!
-//! This implementation is inspired by the Loro library, which uses the Fugue
-//! algorithm for text sequences. Fugue minimizes interleaving in concurrent
-//! edits through a dual-origin approach.
+//! This implementation is inspired by Joseph Gentle's diamond-types CRDT,
+//! which achieves 5000x better performance than Automerge through:
 //!
-//! # Fugue Algorithm
-//!
-//! The key insight of Fugue is that each character stores two origins:
-//! - `origin_left`: The ID of the character immediately to the left when inserted
-//! - `origin_right`: The ID of the character immediately to the right when inserted
-//!
-//! When concurrent inserts happen at the same position, Fugue first resolves
-//! conflicts using `origin_left`. If there is still ambiguity (same left origin),
-//! it uses `origin_right` to break ties. This prevents interleaving of concurrent
-//! text passages.
+//! 1. Separating content from CRDT metadata
+//! 2. Using B-trees instead of linked lists for O(log n) operations
+//! 3. Run-length encoding spans of consecutive characters
+//! 4. Cursor caching for sequential access patterns
 //!
 //! # Architecture
 //!
-//! - Uses B-tree based storage for O(log n) operations
-//! - Run-length encoding / span coalescing for memory efficiency
-//! - Separates content storage from CRDT metadata
+//! - `spans`: B-tree of `Span` items, weighted by visible character count
+//! - `users`: Table mapping `KeyPub` to compact `UserIdx`
+//! - `user_content`: Per-user content buffers (separate from CRDT metadata)
+//! - `clock`: Lamport clock for ordering
+//! - `cursor_cache`: Cache for amortizing sequential lookups
 //!
 //! # Example
 //!
 //! ```
-//! use together::crdt::loro::LoroRga;
-//! use together::crdt::rga_trait::Rga;
-//! use together::key::KeyPair;
+//! use pedagogy::diamond::DiamondRga;
+//! use pedagogy::rga_trait::Rga;
+//! use pedagogy::key::KeyPair;
 //!
 //! let user = KeyPair::generate();
-//! let mut doc = LoroRga::new();
+//! let mut doc = DiamondRga::new();
 //!
 //! doc.insert(&user.key_pub, 0, b"Hello");
 //! doc.insert(&user.key_pub, 5, b" World");
@@ -44,9 +39,11 @@
 //! assert_eq!(doc.to_string(), "Hello");
 //! ```
 
+use std::cmp::Ordering;
+
 use crate::key::KeyPub;
 use super::btree_list::BTreeList;
-use super::primitives::{UserTable, LamportClock, UserIdx};
+use super::primitives::{UserTable, LamportClock, UserIdx, CursorCache, BTreeLocation};
 use super::rga_trait::Rga;
 
 // =============================================================================
@@ -55,14 +52,15 @@ use super::rga_trait::Rga;
 
 /// A span of consecutive characters from one user.
 ///
-/// Loro uses span coalescing to reduce memory usage. Consecutive characters
-/// from the same user with compatible origins are merged into single spans.
+/// Unlike yjs which stores one Item per insertion, diamond-types coalesces
+/// consecutive characters from the same user into spans. This reduces memory
+/// usage and improves cache locality.
 ///
 /// Each span stores:
 /// - User and sequence range
-/// - Left and right origins (for Fugue conflict resolution)
+/// - Left and right origins (for YATA conflict resolution)
 /// - Content offset (into user's content buffer)
-/// - Deletion state (using delete counter, not tombstone)
+/// - Deletion state
 #[derive(Clone, Debug)]
 struct Span {
     /// User who created this span.
@@ -72,13 +70,10 @@ struct Span {
     /// Number of characters in this span.
     len: u32,
     /// Left origin: what was to the left when this was inserted.
-    /// None means inserted at the beginning.
-    origin_left: Option<(UserIdx, u32)>,
+    left_origin: Option<(UserIdx, u32)>,
     /// Right origin: what was to the right when this was inserted.
-    /// None means inserted at the end.
-    origin_right: Option<(UserIdx, u32)>,
+    right_origin: Option<(UserIdx, u32)>,
     /// Whether this span is deleted.
-    /// Loro uses delete counters, but for simplicity we use a boolean.
     deleted: bool,
     /// Offset into the user's content buffer.
     content_offset: u32,
@@ -90,15 +85,15 @@ impl Span {
         seq: u32,
         len: u32,
         content_offset: u32,
-        origin_left: Option<(UserIdx, u32)>,
-        origin_right: Option<(UserIdx, u32)>,
+        left_origin: Option<(UserIdx, u32)>,
+        right_origin: Option<(UserIdx, u32)>,
     ) -> Span {
         return Span {
             user_idx,
             seq,
             len,
-            origin_left,
-            origin_right,
+            left_origin,
+            right_origin,
             deleted: false,
             content_offset,
         };
@@ -132,15 +127,29 @@ impl Span {
             seq: self.seq + offset,
             len: self.len - offset,
             // Right part's left origin is the last char of left part
-            origin_left: Some((self.user_idx, self.seq + offset - 1)),
+            left_origin: Some((self.user_idx, self.seq + offset - 1)),
             // Right origin stays the same
-            origin_right: self.origin_right,
+            right_origin: self.right_origin,
             deleted: self.deleted,
             content_offset: self.content_offset + offset,
         };
 
         self.len = offset;
         return right;
+    }
+
+    /// Check if this span can be coalesced with the next span.
+    fn can_coalesce(&self, next: &Span) -> bool {
+        return self.user_idx == next.user_idx
+            && self.seq + self.len == next.seq
+            && self.content_offset + self.len == next.content_offset
+            && self.deleted == next.deleted;
+    }
+
+    /// Coalesce with the next span (extend this span).
+    fn coalesce(&mut self, next: &Span) {
+        debug_assert!(self.can_coalesce(next));
+        self.len += next.len;
     }
 }
 
@@ -150,7 +159,7 @@ impl Span {
 
 /// Per-user content storage.
 ///
-/// Loro separates content from CRDT metadata. Each user has their own
+/// Diamond-types separates content from CRDT metadata. Each user has their own
 /// content buffer, and spans reference offsets into this buffer.
 #[derive(Clone, Debug, Default)]
 struct UserContent {
@@ -161,15 +170,15 @@ struct UserContent {
 }
 
 // =============================================================================
-// LoroRga
+// DiamondRga
 // =============================================================================
 
-/// Loro-style RGA using the Fugue algorithm.
+/// Diamond-types style RGA implementation.
 ///
 /// Uses a B-tree for O(log n) position lookups, run-length encoded spans,
 /// and separated content storage.
 #[derive(Clone, Debug)]
-pub struct LoroRga {
+pub struct DiamondRga {
     /// Spans in document order, stored in a B-tree weighted by visible length.
     spans: BTreeList<Span>,
     /// User table mapping KeyPub to UserIdx.
@@ -178,22 +187,25 @@ pub struct LoroRga {
     user_content: Vec<UserContent>,
     /// Lamport clock for ordering.
     clock: LamportClock,
+    /// Cursor cache for sequential access.
+    cursor_cache: CursorCache<BTreeLocation>,
 }
 
-impl Default for LoroRga {
+impl Default for DiamondRga {
     fn default() -> Self {
         return Self::new();
     }
 }
 
-impl LoroRga {
-    /// Create a new empty LoroRga.
-    pub fn new() -> LoroRga {
-        return LoroRga {
+impl DiamondRga {
+    /// Create a new empty DiamondRga.
+    pub fn new() -> DiamondRga {
+        return DiamondRga {
             spans: BTreeList::new(),
             users: UserTable::new(),
             user_content: Vec::new(),
             clock: LamportClock::new(),
+            cursor_cache: CursorCache::new(),
         };
     }
 
@@ -253,16 +265,7 @@ impl LoroRga {
         return self.spans.total_weight();
     }
 
-    /// Insert a span using Fugue ordering rules.
-    ///
-    /// The Fugue algorithm:
-    /// 1. Find the left origin's position
-    /// 2. Scan right through potential conflicts
-    /// 3. Apply Fugue conflict resolution rules:
-    ///    a. First compare by origin_left
-    ///    b. If same origin_left, compare by origin_right
-    ///    c. If same origins, use (peer_id, seq) as tiebreaker
-    /// 4. Insert at the determined position
+    /// Insert a span using YATA ordering rules.
     fn insert_span(&mut self, span: Span) {
         // Track the sequence number
         self.advance_seq(span.user_idx, span.seq + span.len - 1);
@@ -271,11 +274,12 @@ impl LoroRga {
         if self.spans.is_empty() {
             let weight = span.visible_len();
             self.spans.insert(0, span, weight);
+            self.cursor_cache.invalidate();
             return;
         }
 
         // Find left origin position
-        let start_idx = match &span.origin_left {
+        let start_idx = match &span.left_origin {
             None => 0,
             Some((user_idx, seq)) => {
                 match self.find_span_by_id(*user_idx, *seq) {
@@ -295,7 +299,7 @@ impl LoroRga {
         };
 
         // Find right origin position (the boundary we cannot cross)
-        let end_idx = match &span.origin_right {
+        let end_idx = match &span.right_origin {
             None => self.spans.len(),
             Some((user_idx, seq)) => {
                 match self.find_span_by_id(*user_idx, *seq) {
@@ -312,134 +316,27 @@ impl LoroRga {
             }
         };
 
-        // Fugue conflict resolution: scan through items between start_idx and end_idx
-        //
-        // The Fugue algorithm prevents interleaving by considering where existing items
-        // were inserted relative to our insertion point. The key insight:
-        //
-        // We scan forward from our left origin. For each existing item:
-        // - If same origin_left: compare origin_right positions, then ID
-        // - If different origin_left: check if existing's origin_left is "between"
-        //   our origin_left and origin_right (meaning it was inserted into our gap)
-        //
-        // An item whose origin_left points to something BETWEEN our origin_left and
-        // origin_right was inserted "into" the gap we're also inserting into, and
-        // forms a subtree. We need to skip over entire subtrees.
+        // YATA conflict resolution
         let mut insert_idx = start_idx;
-        let mut scanning = true;
 
-        while insert_idx < end_idx && scanning {
+        while insert_idx < end_idx {
             let existing = self.spans.get(insert_idx).unwrap();
-            let existing_left_origin = existing.origin_left;
-            let existing_right_origin = existing.origin_right;
+            let existing_left_origin = existing.left_origin;
 
-            if span.origin_left == existing_left_origin {
-                // Same left origin - this is a sibling insertion
-                // Use origin_right to determine order
-                
-                if span.origin_right == existing_right_origin {
-                    // Same left AND right origins - use ID as final tiebreaker
-                    // Higher ID comes first (arbitrary but consistent)
-                    let new_key = self.users.get_id(span.user_idx);
-                    let existing_key = self.users.get_id(existing.user_idx);
-                    match (new_key, existing_key) {
-                        (Some(new_k), Some(ex_k)) => {
-                            if (ex_k, existing.seq) > (new_k, span.seq) {
-                                // existing has higher ID, insert before it
-                                scanning = false;
-                            } else {
-                                // we have higher ID, continue scanning
-                                insert_idx += 1;
-                            }
-                        }
-                        _ => insert_idx += 1,
-                    }
-                } else {
-                    // Different right origins - compare their positions
-                    // The item with the LEFTWARD right origin should be placed FIRST
-                    // (it was inserted into a "tighter" gap)
-                    //
-                    // None = no right origin = inserted at document end = rightmost position
-                    let existing_ro_precedes = match (&existing_right_origin, &span.origin_right) {
-                        (None, None) => false, // Both at end, equal
-                        (None, Some(_)) => false, // Existing at end, ours is left of that
-                        (Some(_), None) => true, // Existing has finite position, ours at end
-                        (Some(ex_ro), Some(new_ro)) => {
-                            self.origin_precedes(&Some(*ex_ro), &Some(*new_ro))
-                        }
-                    };
-                    
-                    if existing_ro_precedes {
-                        // Existing's right origin is more leftward = tighter gap
-                        // Existing comes first, continue scanning
-                        insert_idx += 1;
-                    } else {
-                        // Our right origin is more leftward or equal
-                        // Check if equal - if so, use ID tiebreaker
-                        let origins_equal = existing_right_origin == span.origin_right;
-                        if origins_equal {
-                            let new_key = self.users.get_id(span.user_idx);
-                            let existing_key = self.users.get_id(existing.user_idx);
-                            match (new_key, existing_key) {
-                                (Some(new_k), Some(ex_k)) => {
-                                    if (ex_k, existing.seq) > (new_k, span.seq) {
-                                        scanning = false;
-                                    } else {
-                                        insert_idx += 1;
-                                    }
-                                }
-                                _ => insert_idx += 1,
-                            }
-                        } else {
-                            // Our right origin is strictly more leftward
-                            // We come first
-                            scanning = false;
-                        }
-                    }
+            let same_left_origin = span.left_origin == existing_left_origin;
+
+            if same_left_origin {
+                let order = self.yata_compare(&span, existing);
+                match order {
+                    Ordering::Less => break,
+                    Ordering::Greater => insert_idx += 1,
+                    Ordering::Equal => return, // Same span
                 }
             } else {
-                // Different left origin
-                //
-                // Key Fugue insight: if existing's origin_left is "between" our
-                // origin_left and origin_right, then existing was inserted into
-                // a child subtree and we should skip over it (continue scanning).
-                //
-                // "Between" means: existing's origin_left is at a position that is
-                // after our origin_left but before (or at) our origin_right.
-                //
-                // If existing's origin_left is at or before our origin_left,
-                // then existing is a sibling or ancestor - stop scanning.
-                
-                let existing_origin_after_ours = !self.origin_precedes(&existing_left_origin, &span.origin_left)
-                    && existing_left_origin != span.origin_left;
-                
-                if existing_origin_after_ours {
-                    // Existing's origin_left is AFTER our origin_left
-                    // This means existing was inserted into a position that came after
-                    // where we're inserting - it belongs to a child subtree
-                    // 
-                    // But we also need to check: is it before our origin_right?
-                    // If existing's origin_left is at or after our origin_right,
-                    // then it's NOT in our subtree - we should stop.
-                    let in_our_subtree = match &span.origin_right {
-                        None => true, // No right boundary, everything after is in subtree
-                        Some(ro) => {
-                            // Check if existing's origin_left is before our origin_right
-                            self.origin_precedes(&existing_left_origin, &Some(*ro))
-                        }
-                    };
-                    
-                    if in_our_subtree {
-                        // Existing is in a child subtree - skip over it
-                        insert_idx += 1;
-                    } else {
-                        // Existing is past our right boundary - stop
-                        scanning = false;
-                    }
+                if self.origin_precedes(&existing_left_origin, &span.left_origin) {
+                    insert_idx += 1;
                 } else {
-                    // Existing's origin_left is at or before our origin_left
-                    // This is a sibling or ancestor - stop scanning
-                    scanning = false;
+                    break;
                 }
             }
         }
@@ -447,6 +344,7 @@ impl LoroRga {
         // Insert at the determined position
         let weight = span.visible_len();
         self.spans.insert(insert_idx, span, weight);
+        self.cursor_cache.invalidate();
     }
 
     /// Split a span at the given offset.
@@ -461,20 +359,72 @@ impl LoroRga {
         // Insert right part
         let right_weight = right.visible_len();
         self.spans.insert(idx + 1, right, right_weight);
+        self.cursor_cache.invalidate();
+    }
+
+    /// YATA comparison for spans with the same left origin.
+    fn yata_compare(&self, new_span: &Span, existing: &Span) -> Ordering {
+        let new_has_ro = new_span.right_origin.is_some();
+        let existing_has_ro = existing.right_origin.is_some();
+
+        // Rule 1: Compare right origins
+        if new_has_ro != existing_has_ro {
+            if new_has_ro && !existing_has_ro {
+                return Ordering::Less; // new comes first
+            } else {
+                return Ordering::Greater; // existing comes first
+            }
+        }
+
+        // Both have right origins - compare
+        if new_has_ro && existing_has_ro {
+            let new_ro = new_span.right_origin.unwrap();
+            let existing_ro = existing.right_origin.unwrap();
+            
+            let new_ro_key = self.users.get_id(new_ro.0);
+            let existing_ro_key = self.users.get_id(existing_ro.0);
+            
+            match (new_ro_key, existing_ro_key) {
+                (Some(new_k), Some(ex_k)) => {
+                    let new_ro_full = (new_k, new_ro.1);
+                    let existing_ro_full = (ex_k, existing_ro.1);
+                    match new_ro_full.cmp(&existing_ro_full) {
+                        Ordering::Greater => return Ordering::Less,
+                        Ordering::Less => return Ordering::Greater,
+                        Ordering::Equal => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Rule 2: Tiebreaker - compare (KeyPub, seq)
+        let new_key_pub = self.users.get_id(new_span.user_idx);
+        let existing_key_pub = self.users.get_id(existing.user_idx);
+        
+        match (new_key_pub, existing_key_pub) {
+            (Some(new_k), Some(ex_k)) => {
+                let new_key = (new_k, new_span.seq);
+                let existing_key = (ex_k, existing.seq);
+                match new_key.cmp(&existing_key) {
+                    Ordering::Greater => Ordering::Less,
+                    Ordering::Less => Ordering::Greater,
+                    Ordering::Equal => Ordering::Equal,
+                }
+            }
+            _ => Ordering::Equal,
+        }
     }
 
     /// Check if origin_a precedes origin_b in document order.
-    ///
-    /// This is used when items have different left origins to determine
-    /// their relative order.
     fn origin_precedes(
         &self,
         origin_a: &Option<(UserIdx, u32)>,
         origin_b: &Option<(UserIdx, u32)>,
     ) -> bool {
         match (origin_a, origin_b) {
-            (None, _) => true, // Beginning precedes everything
-            (_, None) => false, // Nothing precedes beginning
+            (None, _) => true,
+            (_, None) => false,
             (Some((ua, sa)), Some((ub, sb))) => {
                 let pos_a = self.find_span_by_id(*ua, *sa);
                 let pos_b = self.find_span_by_id(*ub, *sb);
@@ -485,15 +435,15 @@ impl LoroRga {
                         }
                         return off_a < off_b;
                     }
-                    (None, Some(_)) => true, // Missing origin treated as beginning
+                    (None, Some(_)) => true,
                     (Some(_), None) => false,
                     (None, None) => {
-                        // Both origins not found - compare by global ID
+                        // Compare by global ID
                         let key_a = self.users.get_id(*ua);
                         let key_b = self.users.get_id(*ub);
                         match (key_a, key_b) {
                             (Some(ka), Some(kb)) => (ka, sa) < (kb, sb),
-                            _ => sa < sb, // Fallback
+                            _ => sa < sb,
                         }
                     }
                 }
@@ -558,13 +508,14 @@ impl LoroRga {
                 i += 3;
             }
         }
+        self.cursor_cache.invalidate();
     }
 
-    /// Map an origin from another LoroRga to this one.
+    /// Map an origin from another DiamondRga to this one.
     fn map_origin(
         &mut self,
         origin: &Option<(UserIdx, u32)>,
-        other: &LoroRga,
+        other: &DiamondRga,
     ) -> Option<(UserIdx, u32)> {
         let (other_user_idx, seq) = (*origin)?;
         let other_user = other.users.get_id(other_user_idx)?;
@@ -576,7 +527,7 @@ impl LoroRga {
     }
 }
 
-impl Rga for LoroRga {
+impl Rga for DiamondRga {
     type UserId = KeyPub;
 
     fn insert(&mut self, user: &Self::UserId, pos: u64, content: &[u8]) {
@@ -593,7 +544,7 @@ impl Rga for LoroRga {
         // Store content in user's buffer
         user_content.content.extend_from_slice(content);
 
-        // Determine left and right origins based on position
+        // Determine left and right origins
         let doc_len = self.calculate_len();
 
         let left_origin = if pos == 0 {
@@ -671,6 +622,7 @@ impl Rga for LoroRga {
                 remaining = 0;
             }
         }
+        self.cursor_cache.invalidate();
     }
 
     fn merge(&mut self, other: &Self) {
@@ -732,8 +684,8 @@ impl Rga for LoroRga {
             }
 
             // Map origins
-            let left_origin = self.map_origin(&other_span.origin_left, other);
-            let right_origin = self.map_origin(&other_span.origin_right, other);
+            let left_origin = self.map_origin(&other_span.left_origin, other);
+            let right_origin = self.map_origin(&other_span.right_origin, other);
 
             let mut span = Span::new(
                 our_user_idx,
@@ -783,14 +735,14 @@ mod tests {
 
     #[test]
     fn empty_document() {
-        let rga = LoroRga::new();
+        let rga = DiamondRga::new();
         assert_eq!(rga.len(), 0);
         assert_eq!(rga.to_string(), "");
     }
 
     #[test]
     fn insert_at_beginning() {
-        let mut rga = LoroRga::new();
+        let mut rga = DiamondRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hello");
         assert_eq!(rga.to_string(), "hello");
@@ -799,7 +751,7 @@ mod tests {
 
     #[test]
     fn insert_at_end() {
-        let mut rga = LoroRga::new();
+        let mut rga = DiamondRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hello");
         rga.insert(&user, 5, b" world");
@@ -808,7 +760,7 @@ mod tests {
 
     #[test]
     fn insert_in_middle() {
-        let mut rga = LoroRga::new();
+        let mut rga = DiamondRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hd");
         rga.insert(&user, 1, b"ello worl");
@@ -817,7 +769,7 @@ mod tests {
 
     #[test]
     fn delete_range() {
-        let mut rga = LoroRga::new();
+        let mut rga = DiamondRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hello world");
         rga.delete(5, 6);
@@ -826,7 +778,7 @@ mod tests {
 
     #[test]
     fn delete_middle() {
-        let mut rga = LoroRga::new();
+        let mut rga = DiamondRga::new();
         let user = make_user();
         rga.insert(&user, 0, b"hello");
         rga.delete(1, 3); // Delete "ell"
@@ -838,8 +790,8 @@ mod tests {
         let user1 = make_user();
         let user2 = make_user();
 
-        let mut a = LoroRga::new();
-        let mut b = LoroRga::new();
+        let mut a = DiamondRga::new();
+        let mut b = DiamondRga::new();
 
         a.insert(&user1, 0, b"A");
         b.insert(&user2, 0, b"B");
@@ -850,7 +802,6 @@ mod tests {
         let mut ba = b.clone();
         ba.merge(&a);
 
-        // Both should have the same result (commutativity)
         assert_eq!(ab.to_string(), ba.to_string());
         assert_eq!(ab.len(), 2);
     }
@@ -858,7 +809,7 @@ mod tests {
     #[test]
     fn merge_idempotent() {
         let user = make_user();
-        let mut rga = LoroRga::new();
+        let mut rga = DiamondRga::new();
         rga.insert(&user, 0, b"hello");
 
         let before = rga.to_string();
@@ -873,10 +824,9 @@ mod tests {
         let user1 = make_user();
         let user2 = make_user();
 
-        let mut a = LoroRga::new();
-        let mut b = LoroRga::new();
+        let mut a = DiamondRga::new();
+        let mut b = DiamondRga::new();
 
-        // Both insert at position 0
         a.insert(&user1, 0, b"A");
         b.insert(&user2, 0, b"B");
 
@@ -886,7 +836,6 @@ mod tests {
         let mut ba = b.clone();
         ba.merge(&a);
 
-        // Should be commutative
         assert_eq!(ab.to_string(), ba.to_string());
     }
 
@@ -896,21 +845,19 @@ mod tests {
         let user2 = make_user();
         let user3 = make_user();
 
-        let mut a = LoroRga::new();
-        let mut b = LoroRga::new();
-        let mut c = LoroRga::new();
+        let mut a = DiamondRga::new();
+        let mut b = DiamondRga::new();
+        let mut c = DiamondRga::new();
 
         a.insert(&user1, 0, b"A");
         b.insert(&user2, 0, b"B");
         c.insert(&user3, 0, b"C");
 
-        // (a merge (b merge c))
         let mut bc = b.clone();
         bc.merge(&c);
         let mut a_bc = a.clone();
         a_bc.merge(&bc);
 
-        // ((a merge b) merge c)
         let mut ab = a.clone();
         ab.merge(&b);
         let mut ab_c = ab;
@@ -924,14 +871,12 @@ mod tests {
         let user1 = make_user();
         let user2 = make_user();
 
-        // Start with shared base "ac"
-        let mut base = LoroRga::new();
+        let mut base = DiamondRga::new();
         base.insert(&user1, 0, b"ac");
 
         let mut a = base.clone();
         let mut b = base.clone();
 
-        // Both insert between 'a' and 'c' (position 1)
         a.insert(&user1, 1, b"b");
         b.insert(&user2, 1, b"x");
 
@@ -941,10 +886,8 @@ mod tests {
         let mut ba = b.clone();
         ba.merge(&a);
 
-        // Should be commutative
         assert_eq!(ab.to_string(), ba.to_string());
 
-        // Both 'b' and 'x' should be between 'a' and 'c'
         let result = ab.to_string();
         assert!(result.starts_with("a"));
         assert!(result.ends_with("c"));
@@ -956,11 +899,11 @@ mod tests {
     fn delete_propagates_through_merge() {
         let user = make_user();
 
-        let mut a = LoroRga::new();
+        let mut a = DiamondRga::new();
         a.insert(&user, 0, b"hello");
 
         let mut b = a.clone();
-        b.delete(1, 3); // Delete "ell"
+        b.delete(1, 3);
 
         a.merge(&b);
 
@@ -970,7 +913,7 @@ mod tests {
     #[test]
     fn span_count_increases_with_splits() {
         let user = make_user();
-        let mut rga = LoroRga::new();
+        let mut rga = DiamondRga::new();
 
         rga.insert(&user, 0, b"hello");
         let count_before = rga.span_count();
@@ -979,54 +922,5 @@ mod tests {
         let count_after = rga.span_count();
 
         assert!(count_after > count_before);
-    }
-
-    #[test]
-    fn fugue_prevents_interleaving_with_shared_base() {
-        // Test that Fugue algorithm prevents character interleaving
-        // when there is a shared base document.
-        //
-        // The Fugue guarantee: When two users concurrently insert text
-        // at the same position in a SHARED document, their text passages
-        // will NOT interleave character-by-character.
-        //
-        // Note: When two users type into completely separate empty documents
-        // (no shared base), interleaving can still occur because each user's
-        // characters have origins relative to their own local insertions.
-        
-        let user1 = make_user();
-        let user2 = make_user();
-
-        // Start with a shared base document
-        let mut base = LoroRga::new();
-        base.insert(&user1, 0, b"[]");  // Shared base: "[]"
-        
-        let mut a = base.clone();
-        let mut b = base.clone();
-
-        // Both users type between '[' and ']' (position 1)
-        // User1 types "Hello" character by character
-        for (i, c) in "Hello".bytes().enumerate() {
-            a.insert(&user1, 1 + i as u64, &[c]);
-        }
-
-        // User2 types "World" character by character at the same position
-        for (i, c) in "World".bytes().enumerate() {
-            b.insert(&user2, 1 + i as u64, &[c]);
-        }
-
-        let mut merged = a.clone();
-        merged.merge(&b);
-
-        let result = merged.to_string();
-        
-        // The result should have Hello and World as contiguous blocks
-        // (either "[HelloWorld]" or "[WorldHello]")
-        // NOT something interleaved like "[HWeolrllod]"
-        assert!(
-            result == "[HelloWorld]" || result == "[WorldHello]",
-            "Expected non-interleaved result, got: {}",
-            result
-        );
     }
 }

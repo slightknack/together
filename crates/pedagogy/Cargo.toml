@@ -1,0 +1,8 @@
+[package]
+name = "pedagogy"
+version = "0.1.0"
+edition = "2024"
+description = "Educational CRDT implementations and primitives"
+
+[dependencies]
+rustc-hash = "2"

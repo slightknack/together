@@ -43,10 +43,10 @@
 //! # Example
 //!
 //! ```
-//! use together::crdt::log_integration::{OpLog, Operation};
-//! use together::crdt::rga_optimized::OptimizedRga;
-//! use together::crdt::rga_trait::Rga;
-//! use together::key::KeyPair;
+//! use pedagogy::log_integration::{OpLog, Operation};
+//! use pedagogy::rga_optimized::OptimizedRga;
+//! use pedagogy::rga_trait::Rga;
+//! use pedagogy::key::KeyPair;
 //!
 //! // Create and edit a document
 //! let user = KeyPair::generate();
@@ -731,8 +731,8 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::crdt::rga_optimized::OptimizedRga;
-    use crate::crdt::rga_trait::Rga;
+    use crate::rga_optimized::OptimizedRga;
+    use crate::rga_trait::Rga;
     use crate::key::KeyPair;
 
     fn make_user() -> KeyPub {
