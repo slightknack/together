@@ -1,8 +1,8 @@
----
++++
 author = "Isaac Clayton"
-date = "2026-01-29"
+date = 2026-01-29
 managed = "human"
----
++++
 
 # together
 

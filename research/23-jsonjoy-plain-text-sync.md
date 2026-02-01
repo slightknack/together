@@ -1,10 +1,10 @@
----
++++
 model = "claude-opus-4-5"
-created = "2026-01-31"
-modified = "2026-01-31"
+created = 2026-01-31
+modified = 2026-01-31
 driver = "Isaac Clayton"
 source = "https://jsonjoy.com/blog/collaborative-text-sync-plain-text"
----
++++
 
 # json-joy: Collaborative Text Editors (Part 2) - Plain Text Synchronization
 

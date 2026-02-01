@@ -1,9 +1,9 @@
----
++++
 model = "claude-opus-4-5"
-created = "2026-01-31"
-modified = "2026-01-31"
+created = 2026-01-31
+modified = 2026-01-31
 driver = "Isaac Clayton"
----
++++
 
 # Procedure: Performance Optimization
 

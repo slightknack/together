@@ -1,10 +1,10 @@
----
++++
 model = "claude-opus-4-5"
-created = "2026-01-31"
-modified = "2026-01-31"
+created = 2026-01-31
+modified = 2026-01-31
 driver = "Isaac Clayton"
 source = "json-joy blog posts research"
----
++++
 
 # json-joy Research: New Optimization Ideas for Together
 

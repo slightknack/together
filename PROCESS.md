@@ -1,9 +1,9 @@
----
++++
 model = "claude-opus-4-5"
-created = "2026-01-29"
-modified = "2026-01-31"
+created = 2026-01-29
+modified = 2026-01-31
 driver = "Isaac Clayton"
----
++++
 
 # Process
 
@@ -618,7 +618,7 @@ A file without frontmatter is assumed to be human-managed. Human-managed files s
 ```
 ---
 author = "Isaac Clayton"
-date = "2026-01-29"
+date = 2026-01-29
 managed = "human"
 ---
 ```
@@ -627,7 +627,7 @@ For Rust source files:
 
 ```rust
 // author = "Isaac Clayton"
-// date = "2026-01-29"
+// date = 2026-01-29
 // managed = "human"
 ```
 
@@ -646,8 +646,8 @@ Machine-managed files are generated or substantially edited by a chisel. They us
 ```
 ---
 model = "claude-opus-4-5"
-created = "2026-01-29"
-modified = "2026-01-29"
+created = 2026-01-29
+modified = 2026-01-29
 driver = "Isaac Clayton"
 ---
 ```
@@ -656,8 +656,8 @@ For Rust source files:
 
 ```rust
 // model = "claude-opus-4-5"
-// created = "2026-01-29"
-// modified = "2026-01-29"
+// created = 2026-01-29
+// modified = 2026-01-29
 // driver = "Isaac Clayton"
 ```
 
