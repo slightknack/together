@@ -584,6 +584,7 @@ macro_rules! run_conformance_tests {
 use together::crdt::cola::ColaRga;
 use together::crdt::diamond::DiamondRga;
 use together::crdt::json_joy::JsonJoyRga;
+use together::crdt::loro::LoroRga;
 use together::crdt::yjs::YjsRga;
 use together::key::KeyPair;
 use together::key::KeyPub;
@@ -602,6 +603,10 @@ fn make_cola_rga() -> ColaRga {
 
 fn make_json_joy_rga() -> JsonJoyRga {
     return JsonJoyRga::new();
+}
+
+fn make_loro_rga() -> LoroRga {
+    return LoroRga::new();
 }
 
 fn make_user() -> KeyPub {
@@ -635,6 +640,14 @@ run_conformance_tests!(
 run_conformance_tests!(
     json_joy_rga,
     make_json_joy_rga,
+    make_user(),
+    make_user(),
+    make_user()
+);
+
+run_conformance_tests!(
+    loro_rga,
+    make_loro_rga,
     make_user(),
     make_user(),
     make_user()

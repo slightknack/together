@@ -9,6 +9,7 @@ mod btree_list;
 pub mod cola;
 pub mod diamond;
 pub mod json_joy;
+pub mod loro;
 pub mod op;
 pub mod primitives;
 pub mod rga;
