@@ -45,7 +45,21 @@ required-features = ["bench"]
 
 [features]
 bench = ["rand"]
+afl = ["dep:afl"]
 
 [dependencies.rand]
 version = "0.8"
 optional = true
+
+[dependencies.afl]
+version = "0.15"
+optional = true
+
+[[bin]]
+name = "fuzz_rga"
+path = "src/bin/fuzz_rga.rs"
+required-features = ["afl"]
+
+[[bin]]
+name = "repro_crash"
+path = "src/bin/repro_crash.rs"

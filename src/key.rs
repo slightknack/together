@@ -78,6 +78,23 @@ impl KeyPair {
             key_sec: KeySec(signing.to_bytes()),
         };
     }
+    
+    /// Generate a deterministic keypair from a seed.
+    /// Useful for reproducible testing.
+    pub fn from_seed(seed: u64) -> KeyPair {
+        let mut bytes = [0u8; 32];
+        // Use the seed to create deterministic bytes
+        let seed_bytes = seed.to_le_bytes();
+        for i in 0..32 {
+            bytes[i] = seed_bytes[i % 8].wrapping_add(i as u8);
+        }
+        let signing = SigningKey::from_bytes(&bytes);
+        let verifying = signing.verifying_key();
+        return KeyPair {
+            key_pub: KeyPub(verifying.to_bytes()),
+            key_sec: KeySec(signing.to_bytes()),
+        };
+    }
 
     /// Sign a message.
     pub fn sign(&self, message: &[u8]) -> Signature {
