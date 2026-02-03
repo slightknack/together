@@ -280,6 +280,16 @@ impl Span {
         return self.origin_user_idx != NO_ORIGIN_USER;
     }
 
+    /// Returns true if this span is a "split continuation" - the right part of
+    /// a span that was split. Such spans have their origin pointing to the last
+    /// character of the left part, and are NOT true siblings for RGA ordering.
+    ///
+    /// A split continuation has: same user as origin, seq = origin_seq + 1
+    #[inline(always)]
+    fn is_split_continuation(&self) -> bool {
+        return self.user_idx == self.origin_user_idx && self.seq == self.origin_seq + 1;
+    }
+
     #[inline(always)]
     fn contains_seq(&self, seq: u32) -> bool {
         return seq >= self.seq && seq < self.seq + self.len;
@@ -293,6 +303,9 @@ impl Span {
     ///
     /// The right part's origin is automatically set to the last character of the
     /// left part, maintaining the invariant that each span knows what it follows.
+    ///
+    /// NOTE: This method is for INSERTION splits. For deletion splits, use
+    /// `split_preserving_origin` instead to maintain correct RGA ordering.
     #[inline]
     fn split(&mut self, offset: u32) -> Span {
         debug_assert!(offset > 0 && offset < self.len);
@@ -303,6 +316,33 @@ impl Span {
             len: self.len - offset,
             origin_user_idx: self.user_idx,
             origin_seq: self.seq + offset - 1,
+            content_offset: self.content_offset + offset,
+            user_idx: self.user_idx,
+            deleted: self.deleted,
+            _padding: [0; 1],
+        };
+        self.len = offset;
+        return right;
+    }
+    
+    /// Split this span for deletion, preserving the original origin.
+    ///
+    /// Unlike `split()`, this method keeps the right part's origin the same as
+    /// the original span. This is critical for deletion: when we delete the
+    /// prefix of a span, the remaining suffix should keep its original origin
+    /// so that RGA ordering remains correct during merges.
+    ///
+    /// Example: If "ABCDEF" was inserted at the beginning (no origin), and we
+    /// delete "AB", the remaining "CDEF" should still have no origin - it was
+    /// still inserted at the beginning of the document.
+    #[inline]
+    fn split_preserving_origin(&mut self, offset: u32) -> Span {
+        debug_assert!(offset > 0 && offset < self.len);
+        let right = Span {
+            seq: self.seq + offset,
+            len: self.len - offset,
+            origin_user_idx: self.origin_user_idx,  // Keep original origin
+            origin_seq: self.origin_seq,            // Keep original origin
             content_offset: self.content_offset + offset,
             user_idx: self.user_idx,
             deleted: self.deleted,
@@ -478,6 +518,44 @@ impl Rga {
         return self.spans.len();
     }
 
+    /// Debug: dump all spans with their weights and content.
+    #[allow(dead_code)]
+    pub fn debug_dump_users(&self) {
+        eprintln!("=== User Table ({} users) ===", self.users.idx_to_key.len());
+        for (idx, key) in self.users.idx_to_key.iter().enumerate() {
+            eprintln!("  user_idx={} -> {:02x}{:02x}...", idx, key.0[0], key.0[1]);
+        }
+        eprintln!("=== End User Table ===");
+    }
+    
+    pub fn debug_dump_spans(&self) {
+        eprintln!("=== RGA Span Dump ({} spans, len={}) ===", self.spans.len(), self.spans.total_weight());
+        let mut visible_pos = 0u64;
+        for i in 0..self.spans.len() {
+            let span = self.spans.get(i).unwrap();
+            let user_key = self.users.get_key(span.user_idx).unwrap();
+            let user_short = format!("{:02x}{:02x}", user_key.0[0], user_key.0[1]);
+            let col = &self.columns[span.user_idx as usize];
+            let start = span.content_offset as usize;
+            let end = start + span.len as usize;
+            let content = &col.content[start..end];
+            let content_str = String::from_utf8_lossy(content);
+            let origin_str = if span.has_origin() {
+                let origin = span.origin();
+                format!("(u{},s{})", origin.user_idx, origin.seq)
+            } else {
+                "none".to_string()
+            };
+            let del = if span.deleted { "D" } else { "" };
+            eprintln!(
+                "  [{}] u={} seq={} len={}{} origin={} @{} {:?}",
+                i, user_short, span.seq, span.len, del, origin_str, visible_pos, content_str
+            );
+            visible_pos += span.visible_len() as u64;
+        }
+        eprintln!("=== End Dump ===");
+    }
+
     /// Get or create a user index, ensuring the column exists.
     fn ensure_user(&mut self, user: &KeyPub) -> u16 {
         let idx = self.users.get_or_insert(user);
@@ -566,6 +644,10 @@ impl Rga {
                 remaining -= span_visible;
             } else if offset_in_span == 0 {
                 // Case 2: Delete prefix of span - split and delete left part
+                // Use split() so the surviving right part's origin points to
+                // the last char of the deleted left part (the tombstone).
+                // This ensures correct RGA ordering: the right part follows
+                // the tombstone, not competing with other no-origin spans.
                 let mut span = self.spans.remove(span_idx);
                 let right = span.split(remaining as u32);
                 span.deleted = true;
@@ -574,6 +656,9 @@ impl Rga {
                 remaining = 0;
             } else if offset_in_span + remaining >= span_visible {
                 // Case 3: Delete suffix of span - split and delete right part
+                // Use split() so the tombstone's origin points to the last char
+                // of the surviving left part. This ensures correct positioning
+                // when the tombstone is merged into other replicas.
                 let to_delete = span_visible - offset_in_span;
                 let mut span = self.spans.remove(span_idx);
                 let mut right = span.split(offset_in_span as u32);
@@ -583,6 +668,13 @@ impl Rga {
                 remaining -= to_delete;
             } else {
                 // Case 4: Delete middle of span - split twice, delete middle
+                // The left span keeps its original origin.
+                // The right span needs origin pointing to the last char of the
+                // deleted middle part (tombstone), so it maintains correct RGA
+                // ordering during merges.
+                // We achieve this by using split() for both splits:
+                // 1. First split: mid_right gets origin -> last char of span
+                // 2. Second split: right gets origin -> last char of mid_right (tombstone)
                 let mut span = self.spans.remove(span_idx);
                 let mut mid_right = span.split(offset_in_span as u32);
                 let right = mid_right.split(remaining as u32);
@@ -907,9 +999,36 @@ impl Rga {
         }
 
         if pos == 0 {
-            // Inserting at document beginning - cache is invalidated because
-            // all span indices shift by one.
-            self.spans.insert(0, span, span_len);
+            // Inserting at document beginning in a LOCAL edit.
+            //
+            // We must use RGA ordering among no-origin spans to ensure convergence.
+            // If we just prepend, the local order won't match what merge produces,
+            // causing divergence when this span is merged into other replicas.
+            //
+            // Find the correct position using RGA sibling ordering: higher (user, seq)
+            // has priority and goes first. Skip spans that have origins (they are
+            // children of other spans).
+            let span_user = self.users.get_key(span.user_idx).unwrap();
+            let mut insert_idx = 0;
+            while insert_idx < self.spans.len() {
+                let other = self.spans.get(insert_idx).unwrap();
+                // Skip spans that have an origin - they are children of some
+                // other span and don't participate in no-origin ordering.
+                if other.has_origin() {
+                    insert_idx += 1;
+                    continue;
+                }
+                // This is a no-origin span - compare for RGA ordering
+                let other_user = self.users.get_key(other.user_idx).unwrap();
+                if (other_user, other.seq) > (span_user, span.seq) {
+                    // Other span has higher priority - we go after it and its descendants
+                    insert_idx += 1;
+                } else {
+                    // We have higher priority - insert here
+                    break;
+                }
+            }
+            self.spans.insert(insert_idx, span, span_len);
             self.cursor_cache.invalidate();
             return;
         }
@@ -1018,22 +1137,132 @@ impl Rga {
             return;
         }
 
-        // Cannot coalesce - must insert as a new span
-        if offset_in_prev == prev_visible_len - 1 {
+        // Cannot coalesce - must insert as a new span.
+        // We need to respect RGA sibling ordering: if there are other spans
+        // with the same origin that have higher (user, seq), we insert after them.
+        let origin_user_idx = prev_span.user_idx;
+        let span_user = self.users.get_key(span.user_idx).unwrap().clone();
+        
+        // First, handle any necessary split
+        let (base_insert_idx, _right_split_idx) = if offset_in_prev >= prev_visible_len.saturating_sub(1) {
             // Inserting at the end of prev_span - no split needed
-            self.spans.insert(prev_idx + 1, span, span_len);
-            self.cursor_cache.invalidate();
+            (prev_idx + 1, None)
         } else {
             // Inserting in the middle of prev_span - must split it first.
-            // After split: [left part] [new span] [right part]
+            // The right part gets origin pointing to the last char of the left part.
+            // We'll update its origin later to point to our new insert.
             let split_offset = (offset_in_prev + 1) as u32;
             let mut existing = self.spans.remove(prev_idx);
+            debug_assert!(
+                split_offset > 0 && split_offset < existing.len,
+                "Invalid split: offset={}, len={}, prev_visible_len={}, offset_in_prev={}",
+                split_offset, existing.len, prev_visible_len, offset_in_prev
+            );
             let right = existing.split(split_offset);
             self.spans.insert(prev_idx, existing, existing.visible_len() as u64);
-            self.spans.insert(prev_idx + 1, span, span_len);
-            self.spans.insert(prev_idx + 2, right, right.visible_len() as u64);
-            self.cursor_cache.invalidate();
+            self.spans.insert(prev_idx + 1, right, right.visible_len() as u64);
+            // Insert position is after the left part (prev_idx), before the right part
+            (prev_idx + 1, Some(prev_idx + 1))
+        };
+        
+        // Determine where to insert among siblings with the same origin.
+        // RGA ordering: higher (user, seq) comes first among siblings.
+        //
+        // IMPORTANT: We skip "split continuations" during sibling ordering.
+        // A split continuation is a span created by splitting an existing span,
+        // identifiable by: user_idx == origin_user_idx && seq == origin_seq + 1.
+        // These are not real concurrent inserts and should stay in their natural
+        // position (after the original content they were split from).
+        let origin_key = (origin_user_idx, origin_seq);
+        let mut insert_idx = base_insert_idx;
+        
+        // Check for siblings in the origin index
+        if let Some(sibling_indices) = self.origin_index.get(&origin_key) {
+            for &sibling_idx in sibling_indices {
+                if sibling_idx >= self.spans.len() {
+                    continue;
+                }
+                let sibling = self.spans.get(sibling_idx).unwrap();
+                if !sibling.has_origin() {
+                    continue;
+                }
+                let sibling_origin = sibling.origin();
+                if sibling_origin.user_idx != origin_user_idx || sibling_origin.seq != origin_seq {
+                    continue;
+                }
+                // Skip split continuations - they're not real siblings
+                if sibling.is_split_continuation() {
+                    continue;
+                }
+                // RGA ordering: if sibling has higher (user, seq), we insert after it
+                let sibling_user = self.users.get_key(sibling.user_idx).unwrap();
+                if (sibling_user, sibling.seq) > (&span_user, span.seq) {
+                    insert_idx = insert_idx.max(sibling_idx + 1);
+                }
+            }
         }
+        
+        // Scan linearly to find all siblings and determine our position.
+        // We must scan past lower-priority siblings because there may be
+        // higher-priority siblings after them (siblings can be interleaved
+        // with their descendants).
+        //
+        // Key insight: when we find a higher-priority sibling at position P,
+        // we need to insert after P AND after all descendants of that sibling.
+        // We track whether we're currently "inside" a higher-priority subtree.
+        let scan_start = base_insert_idx;
+        let mut scan_pos = scan_start;
+        let mut in_higher_priority_subtree = false;
+        
+        while scan_pos < self.spans.len() {
+            let other = self.spans.get(scan_pos).unwrap();
+            if !other.has_origin() {
+                // Hit a root span - stop scanning
+                break;
+            }
+            let other_origin = other.origin();
+            let is_sibling = other_origin.user_idx == origin_user_idx 
+                && other_origin.seq == origin_seq;
+            
+            if is_sibling {
+                // Skip split continuations - they're not real siblings
+                if other.is_split_continuation() {
+                    scan_pos += 1;
+                    continue;
+                }
+                let other_user = self.users.get_key(other.user_idx).unwrap();
+                if (other_user, other.seq) > (&span_user, span.seq) {
+                    // Higher priority sibling - we go after it
+                    in_higher_priority_subtree = true;
+                    scan_pos += 1;
+                    insert_idx = insert_idx.max(scan_pos);
+                } else {
+                    // Lower priority sibling - we're no longer in a higher-priority subtree
+                    in_higher_priority_subtree = false;
+                    scan_pos += 1;
+                }
+            } else {
+                // This is a descendant of some sibling
+                if in_higher_priority_subtree {
+                    // We're in a higher-priority sibling's subtree - stay after it
+                    scan_pos += 1;
+                    insert_idx = insert_idx.max(scan_pos);
+                } else {
+                    // We're in a lower-priority sibling's subtree - just skip
+                    scan_pos += 1;
+                }
+            }
+        }
+        
+        self.spans.insert(insert_idx, span, span_len);
+        
+        // Update origin index for the new span
+        self.origin_index
+            .entry(origin_key)
+            .or_insert_with(SmallVec::new)
+            .push(insert_idx);
+            
+        self.cursor_cache.invalidate();
     }
 
     /// Find the span containing a character identified by ItemId.
@@ -1149,6 +1378,7 @@ impl Rga {
 
                 // If the origin character is in the middle of a span, we must
                 // split it so we can insert immediately after the origin.
+                // The right part gets origin pointing to the last char of the left part.
                 if offset_in_span < origin_span.len - 1 {
                     let mut existing = self.spans.remove(origin_idx);
                     let right = existing.split(offset_in_span + 1);
@@ -1158,6 +1388,12 @@ impl Rga {
 
                 // Find the correct position among siblings (spans sharing this origin).
                 // RGA ordering: higher (user, seq) comes first.
+                //
+                // IMPORTANT: We skip "split continuations" during sibling ordering.
+                // A split continuation is a span created by splitting an existing span,
+                // identifiable by: user_idx == origin_user_idx && seq == origin_seq + 1.
+                // These are not real concurrent inserts and should stay in their natural
+                // position (after the original content they were split from).
                 let origin_key = (origin_user_idx, origin_seq);
                 let span_user = self.users.get_key(span.user_idx).unwrap();
                 let mut insert_pos = origin_idx + 1;
@@ -1180,6 +1416,11 @@ impl Rga {
                             continue;
                         }
                         
+                        // Skip split continuations - they're not real siblings
+                        if sibling.is_split_continuation() {
+                            continue;
+                        }
+                        
                         // RGA ordering: if sibling has higher (user, seq), we insert after it
                         let sibling_user = self.users.get_key(sibling.user_idx).unwrap();
                         if (sibling_user, sibling.seq) > (span_user, span.seq) {
@@ -1190,23 +1431,58 @@ impl Rga {
                 
                 // Also scan linearly from origin+1 to catch any unindexed siblings.
                 // This ensures correctness even if the index is incomplete.
-                let mut pos = origin_idx + 1;
+                //
+                // IMPORTANT: When we find a sibling with higher priority, we must
+                // skip past it AND all its descendants. Descendants are spans with
+                // any origin (they're children of some span in the tree). We only
+                // stop when we find another sibling (same origin as us) with lower
+                // priority, or a span with no origin (another root-level insert).
+                let scan_start = origin_idx + 1;
+                let mut pos = scan_start;
+                let mut in_higher_priority_subtree = false;
+                
                 while pos < self.spans.len() {
                     let other = self.spans.get(pos).unwrap();
+                    
+                    // If we hit a span with no origin, stop - it's a root-level insert
                     if !other.has_origin() {
                         break;
                     }
+                    
                     let other_origin = other.origin();
-                    if other_origin.user_idx != origin_user_idx || other_origin.seq != origin_seq {
-                        break;
-                    }
-                    // This span is a sibling - check RGA ordering
-                    let other_user = self.users.get_key(other.user_idx).unwrap();
-                    if (other_user, other.seq) > (span_user, span.seq) {
-                        pos += 1;
-                        insert_pos = insert_pos.max(pos);
+                    // Check if this is a sibling (same origin as us).
+                    let is_sibling = other_origin.user_idx == origin_user_idx 
+                        && other_origin.seq == origin_seq;
+                    
+                    if is_sibling {
+                        // Skip split continuations - they're not real siblings
+                        if other.is_split_continuation() {
+                            pos += 1;
+                            continue;
+                        }
+                        // This is a sibling - check RGA ordering
+                        let other_user = self.users.get_key(other.user_idx).unwrap();
+                        if (other_user, other.seq) > (span_user, span.seq) {
+                            // Higher priority sibling - we go after it
+                            in_higher_priority_subtree = true;
+                            pos += 1;
+                            insert_pos = insert_pos.max(pos);
+                        } else {
+                            // Lower priority sibling - we're no longer in a higher-priority subtree
+                            // but continue scanning in case there are more higher-priority siblings
+                            in_higher_priority_subtree = false;
+                            pos += 1;
+                        }
                     } else {
-                        break;
+                        // This is a descendant of some sibling
+                        if in_higher_priority_subtree {
+                            // We're in a higher-priority sibling's subtree - stay after it
+                            pos += 1;
+                            insert_pos = insert_pos.max(pos);
+                        } else {
+                            // We're in a lower-priority sibling's subtree - just skip
+                            pos += 1;
+                        }
                     }
                 }
                 
@@ -1217,19 +1493,34 @@ impl Rga {
             }
         } else {
             // No origin means insert at document beginning.
-            // Must still respect RGA ordering among other beginning-inserted spans.
+            // Must respect RGA ordering among other no-origin spans.
+            //
+            // IMPORTANT: Spans with origins are "children" of their origin span.
+            // When comparing no-origin spans, we must skip over these children
+            // to find all no-origin siblings. The document is linearized as a
+            // pre-order traversal: each span is followed by all its descendants.
+            //
+            // Example: If we have [C (no-origin), XY (origin=C), DE (origin=C)]
+            // and we want to insert AB (no-origin, user0 < user2), AB should go
+            // AFTER all of C's descendants: [C, XY, DE, AB].
             let span_user = self.users.get_key(span.user_idx).unwrap();
             let mut pos = 0;
             while pos < self.spans.len() {
                 let other = self.spans.get(pos).unwrap();
-                // Only compare with other spans that also have no origin
+                // Skip spans that have an origin - they are children of some
+                // other span and don't participate in no-origin ordering.
                 if other.has_origin() {
-                    break;
+                    pos += 1;
+                    continue;
                 }
+                // This is a no-origin span - compare for RGA ordering
                 let other_user = self.users.get_key(other.user_idx).unwrap();
                 if (other_user, other.seq) > (span_user, span.seq) {
+                    // Other span has higher priority - we go after it and all
+                    // its descendants. Skip to find the next no-origin span.
                     pos += 1;
                 } else {
+                    // We have higher priority - insert here
                     break;
                 }
             }
@@ -1267,24 +1558,24 @@ impl Rga {
             self.spans.get_mut(idx).unwrap().deleted = true;
             self.spans.update_weight(idx, 0);
         } else if offset == 0 {
-            // Delete first item
+            // Delete first item - use split_preserving_origin so survivor keeps origin
             let mut existing = self.spans.remove(idx);
-            let right = existing.split(1);
+            let right = existing.split_preserving_origin(1);
             existing.deleted = true;
             self.spans.insert(idx, existing, 0);
             self.spans.insert(idx + 1, right, right.visible_len() as u64);
         } else if offset == span_len - 1 {
-            // Delete last item
+            // Delete last item - use split_preserving_origin for consistency
             let mut existing = self.spans.remove(idx);
-            let mut right = existing.split(offset);
+            let mut right = existing.split_preserving_origin(offset);
             right.deleted = true;
             self.spans.insert(idx, existing, existing.visible_len() as u64);
             self.spans.insert(idx + 1, right, 0);
         } else {
-            // Delete middle item
+            // Delete middle item - first split sets origin, second preserves it
             let mut existing = self.spans.remove(idx);
             let mut mid_right = existing.split(offset);
-            let right = mid_right.split(1);
+            let right = mid_right.split_preserving_origin(1);
             mid_right.deleted = true;
             self.spans.insert(idx, existing, existing.visible_len() as u64);
             self.spans.insert(idx + 1, mid_right, 0);
@@ -1523,25 +1814,58 @@ impl Default for RgaBuf {
 
 impl super::Crdt for Rga {
     fn merge(&mut self, other: &Self) {
-        for span in other.spans.iter() {
+        // Phase 1: Sync all inserts
+        // We must apply spans in sequence order per user, not document order.
+        // Collect spans and sort by (user_idx, seq) to ensure contiguous sequences.
+        let mut spans_to_apply: Vec<_> = other.spans.iter().collect();
+        spans_to_apply.sort_by_key(|s| (s.user_idx, s.seq));
+        
+        for span in spans_to_apply.iter() {
             // Get the user's KeyPub from other's UserTable
             let other_user = other.users.get_key(span.user_idx).unwrap();
             
-            // Check if we already have this span
-            let first_id = ItemId {
-                user: *other_user,
-                seq: span.seq as u64,
+            // Check what sequences we already have for this user.
+            // A coalesced span might have grown since we last synced, so we
+            // can't just check if the first ID exists - we need to apply any
+            // new content that extends beyond what we have.
+            let self_user_idx = self.users.get(other_user);
+            let our_next_seq = if let Some(idx) = self_user_idx {
+                self.columns[idx as usize].next_seq
+            } else {
+                0
             };
-            if self.find_span_by_id(&first_id).is_some() {
+            
+            // Skip spans we fully have
+            let span_end_seq = span.seq + span.len;
+            if span_end_seq <= our_next_seq {
                 continue;
             }
-
+            
+            // We might have partial content. Calculate what's new.
+            let new_start_offset = if span.seq < our_next_seq {
+                (our_next_seq - span.seq) as usize
+            } else {
+                0
+            };
+            let new_seq = span.seq + new_start_offset as u32;
+            let _new_len = span.len - new_start_offset as u32;
+            
             let other_column = &other.columns[span.user_idx as usize];
             let content = &other_column.content
-                [span.content_offset as usize..(span.content_offset + span.len) as usize];
+                [(span.content_offset + new_start_offset as u32) as usize
+                 ..(span.content_offset + span.len) as usize];
 
-            // Get the origin from the span's stored (user_idx, seq)
-            let origin = if span.has_origin() {
+            // Compute the origin for the new content.
+            // If we're applying a partial span (new_start_offset > 0), the origin
+            // is the last character we already have (seq = new_seq - 1).
+            // Otherwise, use the span's stored origin.
+            let origin = if new_start_offset > 0 {
+                // Origin is the character just before the new content
+                Some(OpItemId {
+                    user: *other_user,
+                    seq: (new_seq - 1) as u64,
+                })
+            } else if span.has_origin() {
                 let origin_id = span.origin();
                 let origin_user = other.users.get_key(origin_id.user_idx).unwrap();
                 Some(OpItemId {
@@ -1552,8 +1876,30 @@ impl super::Crdt for Rga {
                 None
             };
 
-            let block = OpBlock::insert(origin, span.seq as u64, content.to_vec());
+            let block = OpBlock::insert(origin, new_seq as u64, content.to_vec());
             self.apply(other_user, &block);
+        }
+        
+        // Phase 2: Sync all deletions
+        // For each deleted span in `other`, mark the corresponding characters
+        // as deleted in `self`. We must do this after inserts to ensure the
+        // spans exist before we try to delete them.
+        for span in spans_to_apply.iter() {
+            if !span.deleted {
+                continue;
+            }
+            
+            let other_user = other.users.get_key(span.user_idx).unwrap();
+            
+            // Delete each character in this span
+            for offset in 0..span.len {
+                let target = OpItemId {
+                    user: *other_user,
+                    seq: (span.seq + offset) as u64,
+                };
+                let block = OpBlock::delete(target);
+                self.apply(other_user, &block);
+            }
         }
     }
 }
